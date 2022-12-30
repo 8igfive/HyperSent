@@ -1,0 +1,11 @@
+result/
+results/
+scripts/
+data/
+configs/
+__pycache__/
+*.txt
+*.csv
+*.ipynb
+*.sh
+*.config
