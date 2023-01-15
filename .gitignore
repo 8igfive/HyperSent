@@ -1,11 +1,12 @@
-result/
 results/
-scripts/
-data/
+scripts/sh/
+scripts/slurm/
 configs/
 __pycache__/
+data/*
+!data/download_nli.sh
 *.txt
 *.csv
 *.ipynb
-*.sh
 *.config
+!requirements.txt
