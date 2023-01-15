@@ -10,6 +10,7 @@ import json
 
 from dataclasses import dataclass, field
 from typing import Optional, Union, List, Dict, Tuple, cast
+from enum import Enum
 
 from datasets import load_dataset
 
@@ -181,6 +182,25 @@ class DataTrainingArguments:
 
 @dataclass
 class OurTrainingArguments(TrainingArguments):
+    # Training
+    hierarchy_type: str = field(
+        default="dropout",
+        metadata={
+            "help": "Hierarchy type for training embeddings in hyperbolic space.",
+            "choices": ["dropout", "cluster"]
+        }
+    )
+
+    hierarchy_levels: int = field(
+        default=4,
+        metadata={"help": "Number of Hierarcht level for training embeddings in hyperbolic space."}
+    )
+
+    dump_embeddings_num: int = field(
+        default=1000,
+        metadata={"help": "Number of Embeddings to be dumped after training"}
+    )
+
     # Evaluation
     ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate 
     ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
@@ -189,59 +209,6 @@ class OurTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Evaluate transfer task dev sets (in validation)."}
     )
-
-    dump_embeddings_num: int = field(
-        default=1000,
-        metadata={"help": "Number of Embeddings to be dumped after training"}
-    )
-
-    @cached_property
-    @torch_required
-    def _setup_devices(self) -> "torch.device":
-        logger.info("PyTorch: setting up devices")
-        if self.no_cuda:
-            device = torch.device("cpu")
-            self._n_gpu = 0
-        elif is_torch_tpu_available():
-            import torch_xla.core.xla_model as xm
-            device = xm.xla_device()
-            self._n_gpu = 0
-        elif self.local_rank == -1:
-            # if n_gpu is > 1 we'll use nn.DataParallel.
-            # If you only want to use a specific subset of GPUs use `CUDA_VISIBLE_DEVICES=0`
-            # Explicitly set CUDA to the first (index 0) CUDA device, otherwise `set_device` will
-            # trigger an error that a device index is missing. Index 0 takes into account the
-            # GPUs available in the environment, so `CUDA_VISIBLE_DEVICES=1,2` with `cuda:0`
-            # will use the first GPU in that env, i.e. GPU#1
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            # Sometimes the line in the postinit has not been run before we end up here, so just checking we're not at
-            # the default value.
-            self._n_gpu = torch.cuda.device_count()
-        else:
-            # Here, we'll use torch.distributed.
-            # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
-            #
-            # deepspeed performs its own DDP internally, and requires the program to be started with:
-            # deepspeed  ./program.py
-            # rather than:
-            # python -m torch.distributed.launch --nproc_per_node=2 ./program.py
-            if self.deepspeed:
-                from .integrations import is_deepspeed_available
-
-                if not is_deepspeed_available():
-                    raise ImportError("--deepspeed requires deepspeed: `pip install deepspeed`.")
-                import deepspeed
-
-                deepspeed.init_distributed()
-            else:
-                torch.distributed.init_process_group(backend="nccl")
-            device = torch.device("cuda", self.local_rank)
-            self._n_gpu = 1
-
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-
-        return device
 
 
 def main():
@@ -256,6 +223,10 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    model_args = cast(ModelArguments, model_args)
+    data_args = cast(DataTrainingArguments, data_args)
+    training_args = cast(OurTrainingArguments, training_args)
 
     if (
         os.path.exists(training_args.output_dir)
@@ -328,7 +299,6 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    model_args = cast(ModelArguments, model_args)
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -380,25 +350,25 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        hierarchy_type=training_args.hierarchy_type
     )
     model.resize_token_embeddings(len(tokenizer))
 
     # Prepare features
+    class DatasetType(Enum):
+        PairDataset = "pair_dataset"
+        PairDatasetWithHN = "pair_dataset_with_hard_negatives"
+        UnsupervisedDataset = "unsupervised_dataset"
     column_names = datasets["train"].column_names
-    sent2_cname = None
     if len(column_names) == 2:
         # Pair datasets
-        sent0_cname = column_names[0]
-        sent1_cname = column_names[1]
+        dataset_type = DatasetType.PairDataset
     elif len(column_names) == 3:
         # Pair datasets with hard negatives
-        sent0_cname = column_names[0]
-        sent1_cname = column_names[1]
-        sent2_cname = column_names[2]
+        dataset_type = DatasetType.PairDatasetWithHN
     elif len(column_names) == 1:
         # Unsupervised datasets
-        sent0_cname = column_names[0]
-        sent1_cname = column_names[0]
+        dataset_type = DatasetType.UnsupervisedDataset
     else:
         raise NotImplementedError
 
@@ -410,39 +380,34 @@ def main():
         #   exceed the max length.
         # padding = max_length (when pad_to_max_length, for pressure test)
         #   All sentences are padded/truncated to data_args.max_seq_length.
-        total = len(examples[sent0_cname])
 
-        # Avoid "None" fields 
-        for idx in range(total):
-            if examples[sent0_cname][idx] is None:
-                examples[sent0_cname][idx] = " "
-            if examples[sent1_cname][idx] is None:
-                examples[sent1_cname][idx] = " "
-        
-        sentences = examples[sent0_cname] + examples[sent1_cname]
+        total = len(examples[column_names[0]])
 
-        # If hard negative exists
-        if sent2_cname is not None:
-            for idx in range(total):
-                if examples[sent2_cname][idx] is None:
-                    examples[sent2_cname][idx] = " "
-            sentences += examples[sent2_cname]
-
-        sent_features = tokenizer(
-            sentences,
-            max_length=data_args.max_seq_length,
-            truncation=True,
-            padding="max_length" if data_args.pad_to_max_length else False,
-        )
-
-        features = {}
-        if sent2_cname is not None:
-            for key in sent_features:
-                features[key] = [[sent_features[key][i], sent_features[key][i+total], sent_features[key][i+total*2]] for i in range(total)]
-        else:
-            for key in sent_features:
-                features[key] = [[sent_features[key][i], sent_features[key][i+total]] for i in range(total)]
+        if dataset_type == DatasetType.UnsupervisedDataset:
+            sent_name = column_names[0]
             
+            # Avoid "None" fields 
+            for idx in range(total):
+                if examples[sent_name][idx] is None:
+                    examples[sent_name][idx] = " "
+
+            sentences = examples[sent_name]
+            sent_features = tokenizer(
+                sentences,
+                max_length=data_args.max_seq_length,
+                truncation=True,
+                padding="max_length" if data_args.pad_to_max_length else False,
+            )
+            features = {
+                key: [[value] * (2 if training_args.hierarchy_type == "cluster" 
+                                      else training_args.hierarchy_levels) 
+                      for value in values] 
+                for key, values in sent_features.items()
+            }
+
+        else:
+            raise NotImplementedError
+
         return features
 
     if training_args.do_train:
