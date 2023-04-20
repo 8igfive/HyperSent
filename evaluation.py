@@ -1,3 +1,4 @@
+import pdb
 import sys
 import io, os
 import numpy as np
@@ -8,6 +9,7 @@ import torch
 from transformers import AutoTokenizer
 from hypersent.models import BertForHyper, RobertaForHyper
 from typing import Union
+from geoopt.manifolds import PoincareBallExact
 
 # Set up logger
 logging.basicConfig(format='%(asctime)s : %(message)s', level=logging.DEBUG)
@@ -19,6 +21,9 @@ PATH_TO_DATA = './SentEval/data'
 # Import SentEval
 sys.path.insert(0, PATH_TO_SENTEVAL)
 import senteval
+
+# Manifold
+Manifold = PoincareBallExact()
 
 def print_table(task_names, scores):
     tb = PrettyTable()
@@ -78,6 +83,9 @@ def main():
                                          'tenacity': 5, 'epoch_size': 4}
     else:
         raise NotImplementedError
+
+    # use distance from poincare ball for similarity
+    params['similarity'] = lambda x, y: -Manifold.dist(x, y)
 
     # SentEval prepare and batcher
     def prepare(params, samples):

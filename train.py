@@ -1,4 +1,4 @@
-import logging
+# import logging
 import math
 import os
 import sys
@@ -34,6 +34,7 @@ from transformers import (
     BertForPreTraining,
     RobertaModel
 )
+from transformers.utils import logging
 from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTrainedTokenizerBase
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
@@ -42,7 +43,8 @@ from transformers.file_utils import cached_property, torch_required, is_torch_av
 from hypersent.models import RobertaForHyper, BertForHyper, RobertaHyperConfig, BertHyperConfig
 from hypersent.trainers import HyperTrainer, GenerateEmbeddingCallback
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__) # logging
+logger = logging.get_logger() # transformers.utils.logging
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
@@ -201,6 +203,11 @@ class OurTrainingArguments(TrainingArguments):
         metadata={"help": "Number of Embeddings to be dumped after training"}
     )
 
+    dropout_change_layers: int = field(
+        default=12,
+        metadata={"help": "Number of Layers whose dropout will be changed."}
+    )
+
     # Evaluation
     ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate 
     ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
@@ -249,12 +256,12 @@ def main():
         json.dump(all_args, fo, indent=4)
 
     # Setup logging
-    logging.basicConfig(
-        # "%(asctime)s - %(levelname)s - %(name)s -   %(message)s"
-        format="[%(levelname)s|%(filename)s:%(lineno)s] %(asctime)s >> %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
-    )
+    # logging.basicConfig(
+    #     # "%(asctime)s - %(levelname)s - %(name)s -   %(message)s"
+    #     format="[%(levelname)s|%(filename)s:%(lineno)s] %(asctime)s >> %(message)s",
+    #     datefmt="%m/%d/%Y %H:%M:%S",
+    #     level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
+    # )
     # Set the verbosity to info of the Transformers logger (on main process only):
     if is_main_process(training_args.local_rank):
         transformers.utils.logging.set_verbosity_info()
@@ -343,15 +350,20 @@ def main():
     assert model_args.model_name_or_path, "Requires model_name_or_path."
     model_type: Union[RobertaForHyper, BertForHyper] = \
         BertForHyper if model_args.model_type == 'bert' else RobertaForHyper
-    model = model_type.from_pretrained(
+    model, loading_info = model_type.from_pretrained(
         model_args.model_name_or_path,
         config=config,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-        hierarchy_type=training_args.hierarchy_type
+        hierarchy_type=training_args.hierarchy_type,
+        dropout_change_layers=training_args.dropout_change_layers,
+        output_loading_info=True
     )
+    if 'mlp.linear.bias' in loading_info['missing_keys']:
+        model.custom_param_init(config)
+
     model.resize_token_embeddings(len(tokenizer))
 
     # Prepare features
@@ -520,6 +532,8 @@ def main():
         )
         train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
+
+        model.display_loss(125) # display loss log.
 
         output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
         if trainer.is_world_process_zero():

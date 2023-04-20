@@ -1,17 +1,35 @@
-import logging
+# import logging
 import os
 import sys
+import pdb
 import json
 from pathlib import Path
 from packaging import version
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union, Mapping
 
+from geoopt.manifolds import PoincareBallExact
+
 import torch
+from torch import nn
 from torch.utils.data.dataset import Dataset
+from transformers.utils import (
+    is_apex_available,
+    is_sagemaker_mp_enabled,
+    logging,
+)
+from transformers.trainer_pt_utils import nested_detach
 from transformers.debug_utils import DebugOption
 from transformers import Trainer
 from transformers.training_args import TrainingArguments
 from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
+
+if is_apex_available():
+    from apex import amp
+
+if is_sagemaker_mp_enabled():
+    import smdistributed.modelparallel.torch as smp
+
+    from transformers.trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
 
 # Set path to SentEval
 PATH_TO_SENTEVAL = './SentEval'
@@ -24,7 +42,11 @@ import numpy as np
 from datetime import datetime
 from filelock import FileLock
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
+logger = logging.get_logger()
+
+# Manifold
+Manifold = PoincareBallExact()
 
 class GenerateEmbeddingCallback(TrainerCallback):
     def _prepare_input(self, args: TrainingArguments, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
@@ -124,6 +146,8 @@ class HyperTrainer(Trainer):
         params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
                                             'tenacity': 3, 'epoch_size': 2}
 
+        # params['similarity'] = lambda x, y: -Manifold.dist(x, y)
+
         se = senteval.engine.SE(params, batcher, prepare)
         tasks = ['STSBenchmark', 'SICKRelatedness']
         if eval_senteval_transfer and self.args.eval_transfer:
@@ -153,3 +177,157 @@ class HyperTrainer(Trainer):
 
         self._memory_tracker.stop_and_update_metrics(metrics)
         return metrics
+
+    '''
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Override for displaying detailed loss.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        if is_sagemaker_mp_enabled():
+            # scaler = self.scaler if self.do_grad_scaling else None
+            # loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
+            # return loss_mb.reduce_mean().detach().to(self.args.device)
+            raise NotImplementedError
+
+        with self.autocast_smart_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1 and len(loss.shape) > 1:
+            loss = loss.mean(dim=0)  # mean() to average on multi-gpu parallel training
+        # loss of shape=[3]
+        loss_all = loss[0]
+
+        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            loss_all = loss_all / self.args.gradient_accumulation_steps
+
+        if self.do_grad_scaling:
+            self.scaler.scale(loss_all).backward()
+        elif self.use_apex:
+            with amp.scale_loss(loss_all, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        elif self.deepspeed:
+            # loss gets scaled under gradient_accumulation_steps in deepspeed
+            loss_all = self.deepspeed.backward(loss_all)
+        else:
+            loss_all.backward()
+
+        return loss.detach()
+    
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on `model` using `inputs`.
+
+        Override for displaying detailed loss.
+
+        Args:
+            model (`nn.Module`):
+                The model to evaluate.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (`bool`):
+                Whether or not to return the loss only.
+            ignore_keys (`Lst[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
+        """
+        has_labels = all(inputs.get(k) is not None for k in self.label_names)
+        inputs = self._prepare_inputs(inputs)
+        if ignore_keys is None:
+            if hasattr(self.model, "config"):
+                ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", [])
+            else:
+                ignore_keys = []
+
+        # labels may be popped when computing the loss (label smoothing for instance) so we grab them first.
+        if has_labels:
+            labels = nested_detach(tuple(inputs.get(name) for name in self.label_names))
+            if len(labels) == 1:
+                labels = labels[0]
+        else:
+            labels = None
+
+        with torch.no_grad():
+            if is_sagemaker_mp_enabled():
+                # raw_outputs = smp_forward_only(model, inputs)
+                # if has_labels:
+                #     if isinstance(raw_outputs, dict):
+                #         loss_mb = raw_outputs["loss"]
+                #         logits_mb = tuple(v for k, v in raw_outputs.items() if k not in ignore_keys + ["loss"])
+                #     else:
+                #         loss_mb = raw_outputs[0]
+                #         logits_mb = raw_outputs[1:]
+
+                #     loss = loss_mb.reduce_mean().detach().cpu()
+                #     logits = smp_nested_concat(logits_mb)
+                # else:
+                #     loss = None
+                #     if isinstance(raw_outputs, dict):
+                #         logits_mb = tuple(v for k, v in raw_outputs.items() if k not in ignore_keys)
+                #     else:
+                #         logits_mb = raw_outputs
+                #     logits = smp_nested_concat(logits_mb)
+                raise NotImplementedError
+            else:
+                if has_labels:
+                    with self.autocast_smart_context_manager():
+                        loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                    loss = loss.detach()
+                    if len(loss.shape) > 1:
+                        loss = loss.mean(dim=0)
+
+                    if isinstance(outputs, dict):
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])
+                    else:
+                        logits = outputs[1:]
+                else:
+                    loss = None
+                    with self.autocast_smart_context_manager():
+                        outputs = model(**inputs)
+                    if isinstance(outputs, dict):
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
+                    else:
+                        logits = outputs
+                    # TODO: this needs to be fixed and made cleaner later.
+                    if self.args.past_index >= 0:
+                        self._past = outputs[self.args.past_index - 1]
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        logits = nested_detach(logits)
+        if len(logits) == 1:
+            logits = logits[0]
+
+        return (loss, logits, labels)
+        '''
