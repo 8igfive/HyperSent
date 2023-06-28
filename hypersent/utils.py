@@ -1,5 +1,6 @@
 import os
 import re
+import random
 # import logging
 import numpy as np
 import pandas as pd
@@ -8,18 +9,24 @@ import torch
 import matplotlib.pyplot as plt
 import pdb
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, MODEL_FOR_MASKED_LM_MAPPING, TrainingArguments
 from transformers.utils import logging
+from transformers.tokenization_utils_base import PaddingStrategy, PreTrainedTokenizerBase
 from hypersent.models import BertForHyper, RobertaForHyper, BertHyperConfig, RobertaHyperConfig
 from mpl_toolkits.mplot3d import Axes3D
-from typing import Union, List
+from typing import Union, List, Optional, Dict, Tuple
 from geoopt import PoincareBallExact
 from dataclasses import dataclass, field
+from enum import Enum
 
 # logger = logging.getLogger(__name__)
 logger = logging.get_logger()
 Manifold = PoincareBallExact()
 
+MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
+MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+# tools args
 @dataclass
 class VisualizeEmbeddingsArguments:
     visualize_embeddings: bool = field(
@@ -136,6 +143,7 @@ def parse_log(args: ParseLogArguments):
     print('step\teval_stsb_spearman')
     for item in metric_res:
         print('\t'.join(str(i) for i in item))
+
 
 @dataclass
 class CheckEmbedAndCalSimArguments:
@@ -295,3 +303,385 @@ def cal_similarity(args: CheckEmbedAndCalSimArguments):
                            f'{args.model_type}.{os.path.split(args.model_path)[-1]}.json'),
               'w', encoding='utf8') as fo:
         json.dump(similarities, fo, indent=4)
+
+# train args
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
+    """
+
+    # Huggingface's original arguments
+    model_type: Optional[str] = field(
+        # default=None,
+        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES) +\
+        ". Also used to determine backend model."
+        },
+    )
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The model checkpoint for weights initialization."
+            "Don't set if you want to train a model from scratch."
+        },
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
+    )
+    use_fast_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+    )
+    model_revision: str = field(
+        default="main",
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_auth_token: bool = field(
+        default=False,
+        metadata={
+            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
+            "with private models)."
+        },
+    )
+
+    # HyperSent's arguments
+    temp: float = field(
+        default=None,
+        metadata={
+            "help": "Temperature for softmax."
+        }
+    )
+    pooler_type: str = field(
+        default=None,
+        metadata={
+            "help": "What kind of pooler to use.",
+            "choices": ["cls", "avg", "avg.with_special_tokens"]
+        }
+    )
+    hyperbolic_size: int = field(
+        default=None,
+        metadata={
+            "help": "Embedding size for hyperbolic space."
+        }
+    )
+    num_layers: int = field(
+        default=None,
+        metadata={
+            "help": "Number of training layers in Bert/Roberta."
+        }
+    )
+
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    """
+
+    # Huggingface's original arguments. 
+    dataset_name: Optional[str] = field(
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    validation_split_percentage: Optional[int] = field(
+        default=5,
+        metadata={
+            "help": "The percentage of the train set used as validation set in case there's no validation split"
+        },
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of processes to use for the preprocessing."},
+    )
+
+    # HyperSent's arguments
+    train_file: Optional[str] = field(
+        default=None, 
+        metadata={"help": "The training data file (.txt or .csv)."}
+    )
+    validation_file: Optional[str] = field(
+        default=None, 
+        metadata={"help": "The validation data file (.txt or .csv)."}
+    )
+    max_seq_length: Optional[int] = field(
+        default=32,
+        metadata={
+            "help": "The maximum total input sequence length after tokenization. Sequences longer "
+            "than this will be truncated."
+        },
+    )
+    pad_to_max_length: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to pad all samples to `max_seq_length`. "
+            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
+        },
+    )
+
+    def __post_init__(self):
+        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
+            raise ValueError("Need either a dataset name or a training/validation file.")
+        else:
+            if self.train_file is not None:
+                extension = self.train_file.split(".")[-1]
+                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
+
+
+@dataclass
+class OurTrainingArguments(TrainingArguments):
+    # Training
+    hierarchy_type: str = field(
+        default="dropout",
+        metadata={
+            "help": "Hierarchy type for training embeddings in hyperbolic space.",
+            "choices": ["dropout", "cluster", "token_cutoff"]
+        }
+    )
+
+    hierarchy_levels: int = field(
+        default=4,
+        metadata={"help": "Number of Hierarcht level for training embeddings in hyperbolic space."}
+    )
+
+    dump_embeddings_num: int = field(
+        default=1000,
+        metadata={"help": "Number of Embeddings to be dumped after training"}
+    )
+
+    dropout_change_layers: int = field(
+        default=12,
+        metadata={"help": "Number of Layers whose dropout will be changed."}
+    )
+
+    # Evaluation
+    ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate 
+    ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
+    ## both STS and transfer tasks (dev) during training.
+    eval_transfer: bool = field(
+        default=False,
+        metadata={"help": "Evaluate transfer task dev sets (in validation)."}
+    )
+
+# Prepare features
+class DatasetType(Enum):
+    PairDataset = "pair_dataset"
+    PairDatasetWithHN = "pair_dataset_with_hard_negatives"
+    UnsupervisedDataset = "unsupervised_dataset"
+
+@dataclass
+class PrepareFeatures:
+
+    column_names: List[str]
+    dataset_type: DatasetType
+    tokenizer: PreTrainedTokenizerBase
+    data_args: DataTrainingArguments
+    training_args: OurTrainingArguments
+    
+    def __call__(self, examples):
+        # padding = longest (default)
+        #   If no sentence in the batch exceed the max length, then use
+        #   the max sentence length in the batch, otherwise use the 
+        #   max sentence length in the argument and truncate those that
+        #   exceed the max length.
+        # padding = max_length (when pad_to_max_length, for pressure test)
+        #   All sentences are padded/truncated to data_args.max_seq_length.
+
+        total = len(examples[self.column_names[0]])
+
+        if self.dataset_type == DatasetType.UnsupervisedDataset:
+            sent_name = self.column_names[0]
+            
+            # Avoid "None" fields 
+            for idx in range(total):
+                if examples[sent_name][idx] is None:
+                    examples[sent_name][idx] = " "
+
+            sentences = examples[sent_name]
+            sent_features = self.tokenizer(
+                sentences,
+                max_length=self.data_args.max_seq_length,
+                truncation=True,
+                padding="max_length" if self.data_args.pad_to_max_length else False,
+            )
+
+            if self.training_args.hierarchy_type == "cluster" or self.training_args.hierarchy_type == "dropout":
+
+                features = {
+                    key: [[value] * (2 if self.training_args.hierarchy_type == "cluster" 
+                                            else self.training_args.hierarchy_levels) 
+                            for value in values] 
+                    for key, values in sent_features.items()
+                }
+
+            elif self.training_args.hierarchy_type == "token_cutoff":
+
+                features_keys = list(sent_features) + ['loss_pair']
+                features = {key: [] for key in features_keys}
+                
+                if self.training_args.hierarchy_levels > 10:
+                    logger.warn("hierarchy_levels for token_cutoff is limited to no more than 10.")
+                hierarchy_levels = min(self.training_args.hierarchy_levels, 10)
+
+                for sent_i in range(len(sentences)):
+                    sent_len = len(sent_features[features_keys[0]][sent_i]) - 2 # minus 2 for [CLS] and [SEP]
+                    # when sentence is too short, restrict hierarchy_levels
+                    available_hl = min(hierarchy_levels, np.ceil(max(0, sent_len - 10) / 4).astype(int) + 1)
+
+                    remove_i = [sent_j + 1 for sent_j in range(sent_len)] # add 1 for [CLS]
+                    random.shuffle(remove_i)
+                    remove_is = []
+                    for remove_token_num in range(hierarchy_levels): # level1 do not remove token
+                        if remove_token_num >= available_hl: # hierarchy larger than available_hl is fixed to available_hl
+                            remove_is.append(remove_is[-1])
+                        else:
+                            remove_is.append(remove_i[:remove_token_num])
+                    if available_hl > 1: # duplicate for level2
+                        remove_is.insert(1, [remove_i[1]])
+                    else:
+                        remove_is.insert(1, [])
+
+                    for key in features_keys:
+                        if key == 'loss_pair':
+                            features[key].append(self._get_loss_pair(sent_len, available_hl))
+                        else:
+                            features[key].append([[feature_c for feature_i, feature_c in enumerate(sent_features[key][sent_i]) 
+                                                                    if feature_i not in r_is] 
+                                                        for r_is in remove_is])
+                    ''' # FIXME
+                    for input_ids in features['input_ids'][-1]:
+                        print(self.tokenizer.decode(input_ids))
+                    print(features['loss_pair'][-1])
+                    pdb.set_trace()
+                    '''
+        else:
+            raise NotImplementedError
+        
+        return features
+
+    def _get_loss_pair(self, sent_len: int, available_hl: int) \
+            -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+
+        distances = []
+        for sent_i in range(available_hl):
+            for sent_j in range(sent_i + 1, available_hl): # sent_i & sent_j all equals to remove_token_num
+                distances.append(((sent_i if sent_i == 0 else sent_i + 1), sent_j + 1, 
+                                  (sent_j - sent_i) / (sent_len - sent_j)))
+                if sent_i == 1:
+                    distances.append((1, sent_j + 1, 
+                                  (sent_j - sent_i) / (sent_len - sent_j)))
+                elif sent_j == 1: # which means sent_i = 0
+                    distances.append((0, 1, 
+                                  1 / (sent_len - 1)))
+        if available_hl > 1:
+            distances.append((1, 2, 2 / (sent_len - 1)))
+
+        distances_pair = []
+        for dis_i in range(len(distances)):
+            for dis_j in range(dis_i + 1, len(distances)):
+                if distances[dis_i][2] < distances[dis_j][2]:
+                    distances_pair.append((distances[dis_i][0], distances[dis_i][1],
+                                           distances[dis_j][0], distances[dis_j][1]))
+                elif distances[dis_i][2] > distances[dis_j][2]:
+                    distances_pair.append((distances[dis_j][0], distances[dis_j][1],
+                                           distances[dis_i][0], distances[dis_i][1]))
+        
+        return distances_pair
+
+   
+# Data collator
+@dataclass
+class OurDataCollatorWithPadding:
+
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    # mlm: bool = True
+    # mlm_probability: float = data_args.mlm_probability
+
+    def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
+        drop_keys = ['loss_pair']
+        bs = len(features)
+        if bs > 0:
+            num_sent = len(features[0]['input_ids'])
+        else:
+            return
+        flat_features = []
+        for feature in features:
+            for i in range(num_sent):
+                flat_features.append({k: (feature[k][i] if k in special_keys else feature[k]) 
+                                      for k in feature if k not in drop_keys})
+
+        batch = self.tokenizer.pad(
+            flat_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+        # if model_args.do_mlm:
+        #     batch["mlm_input_ids"], batch["mlm_labels"] = self.mask_tokens(batch["input_ids"])
+
+        batch = {k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0] for k in batch}
+
+        for key in drop_keys:
+            if key in features[0]:
+                batch[key] = [feature[key] for feature in features]
+
+        if "label" in batch:
+            batch["labels"] = batch["label"]
+            del batch["label"]
+        if "label_ids" in batch:
+            batch["labels"] = batch["label_ids"]
+            del batch["label_ids"]
+        
+        return batch
+    
+    '''
+    def mask_tokens(
+        self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
+        """
+        inputs = inputs.clone()
+        labels = inputs.clone()
+        # We sample a few tokens in each sequence for MLM training (with probability `self.mlm_probability`)
+        probability_matrix = torch.full(labels.shape, self.mlm_probability)
+        if special_tokens_mask is None:
+            special_tokens_mask = [
+                self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
+            ]
+            special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
+        else:
+            special_tokens_mask = special_tokens_mask.bool()
+
+        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        labels[~masked_indices] = -100  # We only compute loss on masked tokens
+
+        # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
+        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+        inputs[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+
+        # 10% of the time, we replace masked input tokens with random word
+        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
+        inputs[indices_random] = random_words[indices_random]
+
+        # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+        return inputs, labels
+    '''

@@ -10,7 +10,6 @@ import json
 
 from dataclasses import dataclass, field
 from typing import Optional, Union, List, Dict, Tuple, cast
-from enum import Enum
 
 from datasets import load_dataset
 
@@ -26,7 +25,6 @@ from transformers import (
     DataCollatorWithPadding,
     HfArgumentParser,
     Trainer,
-    TrainingArguments,
     default_data_collator,
     set_seed,
     EvalPrediction,
@@ -35,187 +33,22 @@ from transformers import (
     RobertaModel
 )
 from transformers.utils import logging
-from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PaddingStrategy, PreTrainedTokenizerBase
 from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
 
 from hypersent.models import RobertaForHyper, BertForHyper, RobertaHyperConfig, BertHyperConfig
 from hypersent.trainers import HyperTrainer, GenerateEmbeddingCallback
+from hypersent.utils import (
+    ModelArguments, DataTrainingArguments, OurTrainingArguments, 
+    DatasetType, PrepareFeatures, OurDataCollatorWithPadding
+)
 
 # logger = logging.getLogger(__name__) # logging
 logger = logging.get_logger() # transformers.utils.logging
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-@dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
-    """
-
-    # Huggingface's original arguments
-    model_type: Optional[str] = field(
-        # default=None,
-        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES) +\
-        ". Also used to determine backend model."
-        },
-    )
-    model_name_or_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "The model checkpoint for weights initialization."
-            "Don't set if you want to train a model from scratch."
-        },
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-    )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
-        },
-    )
-
-    # HyperSent's arguments
-    temp: float = field(
-        default=None,
-        metadata={
-            "help": "Temperature for softmax."
-        }
-    )
-    pooler_type: str = field(
-        default=None,
-        metadata={
-            "help": "What kind of pooler to use.",
-            "choices": ["cls", "avg", "avg.with_special_tokens"]
-        }
-    )
-    hyperbolic_size: int = field(
-        default=None,
-        metadata={
-            "help": "Embedding size for hyperbolic space."
-        }
-    )
-    num_layers: int = field(
-        default=None,
-        metadata={
-            "help": "Number of training layers in Bert/Roberta."
-        }
-    )
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
-
-    # Huggingface's original arguments. 
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    validation_split_percentage: Optional[int] = field(
-        default=5,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-
-    # HyperSent's arguments
-    train_file: Optional[str] = field(
-        default=None, 
-        metadata={"help": "The training data file (.txt or .csv)."}
-    )
-    validation_file: Optional[str] = field(
-        default=None, 
-        metadata={"help": "The validation data file (.txt or .csv)."}
-    )
-    max_seq_length: Optional[int] = field(
-        default=32,
-        metadata={
-            "help": "The maximum total input sequence length after tokenization. Sequences longer "
-            "than this will be truncated."
-        },
-    )
-    pad_to_max_length: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to pad all samples to `max_seq_length`. "
-            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
-        },
-    )
-
-    def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
-
-
-@dataclass
-class OurTrainingArguments(TrainingArguments):
-    # Training
-    hierarchy_type: str = field(
-        default="dropout",
-        metadata={
-            "help": "Hierarchy type for training embeddings in hyperbolic space.",
-            "choices": ["dropout", "cluster"]
-        }
-    )
-
-    hierarchy_levels: int = field(
-        default=4,
-        metadata={"help": "Number of Hierarcht level for training embeddings in hyperbolic space."}
-    )
-
-    dump_embeddings_num: int = field(
-        default=1000,
-        metadata={"help": "Number of Embeddings to be dumped after training"}
-    )
-
-    dropout_change_layers: int = field(
-        default=12,
-        metadata={"help": "Number of Layers whose dropout will be changed."}
-    )
-
-    # Evaluation
-    ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate 
-    ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
-    ## both STS and transfer tasks (dev) during training.
-    eval_transfer: bool = field(
-        default=False,
-        metadata={"help": "Evaluate transfer task dev sets (in validation)."}
-    )
 
 
 def main():
@@ -365,12 +198,7 @@ def main():
         model.custom_param_init(config)
 
     model.resize_token_embeddings(len(tokenizer))
-
-    # Prepare features
-    class DatasetType(Enum):
-        PairDataset = "pair_dataset"
-        PairDatasetWithHN = "pair_dataset_with_hard_negatives"
-        UnsupervisedDataset = "unsupervised_dataset"
+    
     column_names = datasets["train"].column_names
     if len(column_names) == 2:
         # Pair datasets
@@ -384,132 +212,14 @@ def main():
     else:
         raise NotImplementedError
 
-    def prepare_features(examples):
-        # padding = longest (default)
-        #   If no sentence in the batch exceed the max length, then use
-        #   the max sentence length in the batch, otherwise use the 
-        #   max sentence length in the argument and truncate those that
-        #   exceed the max length.
-        # padding = max_length (when pad_to_max_length, for pressure test)
-        #   All sentences are padded/truncated to data_args.max_seq_length.
-
-        total = len(examples[column_names[0]])
-
-        if dataset_type == DatasetType.UnsupervisedDataset:
-            sent_name = column_names[0]
-            
-            # Avoid "None" fields 
-            for idx in range(total):
-                if examples[sent_name][idx] is None:
-                    examples[sent_name][idx] = " "
-
-            sentences = examples[sent_name]
-            sent_features = tokenizer(
-                sentences,
-                max_length=data_args.max_seq_length,
-                truncation=True,
-                padding="max_length" if data_args.pad_to_max_length else False,
-            )
-            features = {
-                key: [[value] * (2 if training_args.hierarchy_type == "cluster" 
-                                      else training_args.hierarchy_levels) 
-                      for value in values] 
-                for key, values in sent_features.items()
-            }
-
-        else:
-            raise NotImplementedError
-
-        return features
-
     if training_args.do_train:
         train_dataset = datasets["train"].map(
-            prepare_features,
+            PrepareFeatures(column_names, dataset_type, tokenizer, data_args, training_args),
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
-
-    # Data collator
-    @dataclass
-    class OurDataCollatorWithPadding:
-
-        tokenizer: PreTrainedTokenizerBase
-        padding: Union[bool, str, PaddingStrategy] = True
-        max_length: Optional[int] = None
-        pad_to_multiple_of: Optional[int] = None
-        # mlm: bool = True
-        # mlm_probability: float = data_args.mlm_probability
-
-        def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-            special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
-            bs = len(features)
-            if bs > 0:
-                num_sent = len(features[0]['input_ids'])
-            else:
-                return
-            flat_features = []
-            for feature in features:
-                for i in range(num_sent):
-                    flat_features.append({k: feature[k][i] if k in special_keys else feature[k] for k in feature})
-
-            batch = self.tokenizer.pad(
-                flat_features,
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-                return_tensors="pt",
-            )
-            # if model_args.do_mlm:
-            #     batch["mlm_input_ids"], batch["mlm_labels"] = self.mask_tokens(batch["input_ids"])
-
-            batch = {k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0] for k in batch}
-
-            if "label" in batch:
-                batch["labels"] = batch["label"]
-                del batch["label"]
-            if "label_ids" in batch:
-                batch["labels"] = batch["label_ids"]
-                del batch["label_ids"]
-
-            return batch
-        
-        '''
-        def mask_tokens(
-            self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
-            """
-            inputs = inputs.clone()
-            labels = inputs.clone()
-            # We sample a few tokens in each sequence for MLM training (with probability `self.mlm_probability`)
-            probability_matrix = torch.full(labels.shape, self.mlm_probability)
-            if special_tokens_mask is None:
-                special_tokens_mask = [
-                    self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-                ]
-                special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
-            else:
-                special_tokens_mask = special_tokens_mask.bool()
-
-            probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-            masked_indices = torch.bernoulli(probability_matrix).bool()
-            labels[~masked_indices] = -100  # We only compute loss on masked tokens
-
-            # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-            indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-            inputs[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
-
-            # 10% of the time, we replace masked input tokens with random word
-            indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-            random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
-            inputs[indices_random] = random_words[indices_random]
-
-            # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-            return inputs, labels
-        '''
     
     data_collator = default_data_collator if data_args.pad_to_max_length else OurDataCollatorWithPadding(tokenizer)
 

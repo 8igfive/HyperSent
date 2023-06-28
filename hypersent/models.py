@@ -51,15 +51,14 @@ class MLPLayer(nn.Module):
 
 class Similarity(nn.Module):
     """
-    Hyperbolic Similarity
+    Hyperbolic Similarity: Dosn't calculate temp now.
     """
 
-    def __init__(self, temp):
+    def __init__(self):
         super().__init__()
-        self.temp = temp
 
     def forward(self, x, y):
-        return -Manifold.dist(x, y) / self.temp
+        return -Manifold.dist(x, y, dim=-1)
 
 class BertHyperConfig(BertConfig):
     def __init__(self,
@@ -98,7 +97,7 @@ class InitAndForward:
 
         self.pooler_type = config.pooler_type
         self.mlp = MLPLayer(config.hidden_size, config.hyperbolic_size, self.pooler_type)
-        self.similarity = Similarity(temp=config.temp)
+        self.similarity = Similarity()
         self.temp = config.temp
 
         self.level_diffs = None
@@ -186,6 +185,7 @@ class InitAndForward:
         head_mask=None,
         inputs_embeds=None,
         labels=None,
+        loss_pair=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None
@@ -193,77 +193,61 @@ class InitAndForward:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         ori_input_ids = input_ids
         batch_size = input_ids.size(0)
-        # Number of sentences in one instance
         num_sent = input_ids.size(1) # level num
 
-        # if self.hierarchy_type == "dropout":
-        #     pass
-        # else:
-        #     raise NotImplementedError
+        if self.hierarchy_type.count("dropout") or self.hierarchy_type.count("mixup"):
+            # init self.level_diffs
+            if not self.level_diffs or len(self.level_diffs) != num_sent - 2:
+                self._init_level_diffs(num_sent)
 
-        # init self.level_diffs
-        if not self.level_diffs or len(self.level_diffs) != num_sent - 2:
-            self._init_level_diffs(num_sent)
-
-        # Split input based on level and flatten them.
-        levels_input_ids = [input_ids[:, :2].reshape(-1, input_ids.size(-1))]
-        for level in range(2, num_sent):
-        # levels_input_ids = [] # FIXME: new
-        # for level in range(num_sent): # FIXME: new
-            levels_input_ids.append(input_ids[:, level])
-        levels_attention_mask = [attention_mask[:, :2].reshape(-1, attention_mask.size(-1))]
-        for level in range(2, num_sent):
-        # levels_attention_mask = [] # FIXME: new
-        # for level in range(num_sent):  # FIXME: new  
-            levels_attention_mask.append(attention_mask[:, level])
-        if token_type_ids is not None:
-            levels_token_type_ids = [token_type_ids[:, :2].reshape(-1, token_type_ids.size(-1))]
+            # Split input based on level and flatten them.
+            levels_input_ids = [input_ids[:, :2].reshape(-1, input_ids.size(-1))]
             for level in range(2, num_sent):
-            # levels_token_type_ids = [] # FIXME: new
-            # for level in range(num_sent): # FIXME: new  
-                levels_token_type_ids.append(token_type_ids[:, level])
-        else:
-            levels_token_type_ids = [None] * (num_sent - 1)
-            # levels_token_type_ids = [None] * num_sent # FIXME: new
-        
-        levels_hyperbolic_embedding = [] # List of Tensor(size=(bs, hidden_size))
-        levels_outputs = None
-        for level in range(num_sent - 1): # first two levels are in a single input
-            # change dropout
-            # self._change_dropout(encoder, 1 - 0.9**(level + 1))
-            self._change_dropout(encoder, 1 - 0.9 * 0.97**level)
-        # # every level has different dropout
-        # for level in range(num_sent):
-        #     if level == 0:
-        #         self._change_dropout(encoder, 0.1)
-        #     else:
-        #         self._change_dropout(encoder, 1 - 0.9 * 0.97**(level - 1))
-        #     # self._change_dropout(encoder, 1 - 0.95**level)
-        
-            # Get raw embeddings
-            outputs = encoder(
-                levels_input_ids[level],
-                attention_mask=levels_attention_mask[level],
-                token_type_ids=levels_token_type_ids[level],
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                output_attentions=output_attentions,
-                output_hidden_states=True, # if cls.config.pooler_type in ['avg_top2', 'avg_first_last'] else False,
-                return_dict=True,
-            )
-            if not return_dict:
-                if not levels_outputs:
-                    levels_outputs = [([] if isinstance(output, torch.Tensor) else
-                                        tuple([] for _ in output) if isinstance(output, tuple) else
-                                        pdb.set_trace()) for output in outputs]
-                for i, value in enumerate(outputs):
-                    if isinstance(value, torch.Tensor):
-                        levels_outputs[i].append(value)
-                    else:
-                        for j, item in enumerate(value):
-                            levels_outputs[i][j].append(item)
+            # levels_input_ids = [] # FIXME: new
+            # for level in range(num_sent): # FIXME: new
+                levels_input_ids.append(input_ids[:, level])
+            levels_attention_mask = [attention_mask[:, :2].reshape(-1, attention_mask.size(-1))]
+            for level in range(2, num_sent):
+            # levels_attention_mask = [] # FIXME: new
+            # for level in range(num_sent):  # FIXME: new  
+                levels_attention_mask.append(attention_mask[:, level])
+            if token_type_ids is not None:
+                levels_token_type_ids = [token_type_ids[:, :2].reshape(-1, token_type_ids.size(-1))]
+                for level in range(2, num_sent):
+                # levels_token_type_ids = [] # FIXME: new
+                # for level in range(num_sent): # FIXME: new  
+                    levels_token_type_ids.append(token_type_ids[:, level])
             else:
+                levels_token_type_ids = [None] * (num_sent - 1)
+                # levels_token_type_ids = [None] * num_sent # FIXME: new
+            
+            levels_hyperbolic_embedding = [] # List of Tensor(size=(bs, hidden_size))
+            levels_outputs = None
+            for level in range(num_sent - 1): # first two levels are in a single input
+                # change dropout
+                # self._change_dropout(encoder, 1 - 0.9**(level + 1))
+                self._change_dropout(encoder, 1 - 0.9 * 0.97**level)
+            # # every level has different dropout
+            # for level in range(num_sent):
+            #     if level == 0:
+            #         self._change_dropout(encoder, 0.1)
+            #     else:
+            #         self._change_dropout(encoder, 1 - 0.9 * 0.97**(level - 1))
+            #     # self._change_dropout(encoder, 1 - 0.95**level)
+            
+                # Get raw embeddings
+                outputs = encoder(
+                    levels_input_ids[level],
+                    attention_mask=levels_attention_mask[level],
+                    token_type_ids=levels_token_type_ids[level],
+                    position_ids=position_ids,
+                    head_mask=head_mask,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=True, # if cls.config.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+                    return_dict=True,
+                )
+                # for levels_outputs
                 if not levels_outputs:
                     levels_outputs = {key: ([] if isinstance(output, torch.Tensor) else
                                         tuple([] for _ in output) if isinstance(output, tuple) else
@@ -273,145 +257,224 @@ class InitAndForward:
                         levels_outputs[key].append(value)
                     else:
                         for j, item in enumerate(value):
-                            levels_outputs[key][j].append(item) 
+                            levels_outputs[key][j].append(item)
 
-            hyperbolic_embedding: torch.Tensor = self._get_hyperbolic_embedding(levels_attention_mask[level], outputs) # (bs * num_sent, hidden_size)
-            hyperbolic_embedding = hyperbolic_embedding.reshape(batch_size, -1, hyperbolic_embedding.shape[-1])
-            for sublevel in range(hyperbolic_embedding.size(1)):
-                levels_hyperbolic_embedding.append(hyperbolic_embedding[:, sublevel])
-        if not return_dict:
-            for i, values in enumerate(levels_outputs):
-                if isinstance(values, list):
-                    levels_outputs[i] = torch.cat(values, dim=0)
-                else:
-                    levels_outputs[i] = tuple(torch.cat(item, dim=0) for item in values)
-            levels_outputs = tuple(levels_outputs)
-        else:
+                hyperbolic_embedding = self._get_hyperbolic_embedding(levels_attention_mask[level], outputs) # (bs * num_sent, hidden_size)
+                hyperbolic_embedding = hyperbolic_embedding.reshape(batch_size, -1, hyperbolic_embedding.shape[-1])
+                for sublevel in range(hyperbolic_embedding.size(1)):
+                    levels_hyperbolic_embedding.append(hyperbolic_embedding[:, sublevel])
+            # for levels_outputs
             for key, values in levels_outputs.items():
                 if isinstance(values, list):
                     levels_outputs[key] = torch.cat(values, dim=0)
                 else:
                     levels_outputs[key] = tuple(torch.cat(item, dim=0) for item in values)
+                
 
-        # Gather all embeddings if using distributed training
-        if dist.is_initialized() and self.training:
-            for level in range(num_sent):
-                he = levels_hyperbolic_embedding[level]
-                # Dummy vectors for allgather
-                he_list = [torch.zeros_like(he) for _ in range(dist.get_world_size())]
+            # Gather all embeddings if using distributed training
+            if dist.is_initialized() and self.training:
+                for level in range(num_sent):
+                    he = levels_hyperbolic_embedding[level]
+                    # Dummy vectors for allgather
+                    he_list = [torch.zeros_like(he) for _ in range(dist.get_world_size())]
+                    
+                    # Allgather
+                    dist.all_gather(tensor_list=he_list, tensor=he.contiguous())
+
+                    # Since allgather results do not have gradients, we replace the
+                    # current process's corresponding embeddings with original tensors
+                    he_list[dist.get_rank()] = he
+
+                    levels_hyperbolic_embedding[level] = torch.cat(he_list, dim=0)
+
+            levels_hyperbolic_similarity = []
+            loss_fn = nn.CrossEntropyLoss()
+            loss1 = torch.tensor(0.).to(self.device)
+            loss2 = torch.tensor(0.).to(self.device)
+            loss3 = torch.tensor(0.).to(self.device)
+            loss1_count = 0
+            loss2_count = 0
+            he_base: torch.Tensor = levels_hyperbolic_embedding[0] # (batch_size, hidden_size)
+            last_adj_dist: torch.Tensor = None
+            adj_dist_diffs = []
+            if self.hierarchy_type.count('dropout'):
+                for level in range(1, num_sent):
+                    he1: torch.Tensor = levels_hyperbolic_embedding[level - 1] # (batch_size, hidden_size)
+                    he2: torch.Tensor = levels_hyperbolic_embedding[level] # (batch_size, hidden_size)
+
+                    # old l1: positive&negative from previous level
+                    hyperbolic_similarity = self.similarity(he1.unsqueeze(1), he2.unsqueeze(0)) # (bs, bs)
+                    levels_hyperbolic_similarity.append(hyperbolic_similarity)
+                    labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                    loss1 += loss_fn(hyperbolic_similarity / self.temp, labels)
+                    loss1_count += 1
+
+                    '''# new l1: negative from level 0, positive from previous level
+                    he1_tmp = he_base.expand(he_base.shape[0], he_base.shape[0], he_base.shape[1]) # (bs, bs, hs)
+                    he1_tmp = torch.diagonal_scatter(he1_tmp, he1.transpose(0, 1)) # (bs, bs, hs)
+                    hyperbolic_similarity = self.similarity(he2.unsqueeze(1), he1_tmp)
+                    levels_hyperbolic_similarity.append(hyperbolic_similarity)
+                    labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                    loss += loss_fn(hyperbolic_similarity / self.temp, labels)
+                    '''
+
+                    margin_0 = 5e-3 # fixed margin
+                    '''# old l2: make previous level embeddings farther from origin than present level embeddings.
+                    if level > 1: # first 2 levels can be seen as the same level.
+                        he1_dist = Manifold.dist0(he1)
+                        he2_dist = Manifold.dist0(he2)
+                        loss2 += torch.logsumexp(
+                            torch.cat(
+                                [torch.zeros((1,), dtype=he1_dist.dtype, device=he1_dist.device), (he2_dist - he1_dist + margin_0)],
+                                dim=0
+                            # ), 
+                            ) / (self.temp),
+                            0
+                        )
+                        loss2_count += 1
+                    '''
+                    # new l2
+                    if level > 1:
+                        he1_dist = Manifold.dist0(he1)
+                        he2_dist = Manifold.dist0(he2)
+                        # loss2 += F.relu(he2_dist - he1_dist + self.level_diffs[level - 2]).mean() # dynamic
+                        loss2 += F.relu(he2_dist - he1_dist + margin_0).mean() # static
+                        loss2_count += 1
+
+                    '''# l3
+                    adj_dist = Manifold.dist(he_base, he2, dim=-1)
+                    if level > 1:
+                        adj_dist_diffs.append(last_adj_dist - adj_dist)
+                    last_adj_dist = adj_dist
+                    '''
+                margin_1 = 5e-3
+                '''# l3 logsumexp
+                if adj_dist_diffs:
+                    adj_dist_diffs = torch.cat(adj_dist_diffs, dim=-1)
+                    loss3 = torch.logsumexp(
+                        torch.cat([torch.zeros((adj_dist_diffs.shape[0], 1), dtype=adj_dist_diffs.dtype, device=adj_dist_diffs.device),
+                                (adj_dist_diffs + margin_1) / self.temp], dim=-1),
+                        dim=-1
+                    ).mean()
+                '''
+                # l3 triplet
+                # if adj_dist_diffs:
+                #     triplet_score = torch.stack([adj_dist_diffs[l - 1] - adj_dist_diffs[l] + margin_1
+                #                                 for l in range(1, len(adj_dist_diffs))], dim=-1)
+                #     loss3 = triplet_score.mean(dim=-1).mean() # TODO: use mean(dim=-1) or max(dim=-1)
+
+            if self.hierarchy_type.count('mixup'):
+                pass
+
+            loss = torch.tensor(0.).to(device=self.device)
+            if loss1_count:
+                loss1 /= loss1_count
+                self.loss_logs['loss1'].append(loss1.item())
+                loss += loss1
+            if loss2_count:
+                loss2 /= loss2_count
+                self.loss_logs['loss2'].append(loss2.item())
+                loss += loss2
+            if loss3:
+                loss += loss3
+                self.loss_logs['loss3'].append(loss3.item())
+            self.loss_logs['loss_all'].append(loss.item())
+            
+            levels_hyperbolic_similarity = torch.cat(levels_hyperbolic_similarity, dim=0)
+
+        elif self.hierarchy_type.count("token_cutoff"):
+            # flatten input
+            flat_input_ids = input_ids.reshape(-1, input_ids.shape[-1])
+            flat_attention_mask = attention_mask.reshape(-1, attention_mask.shape[-1])
+            flat_token_type_ids = token_type_ids.reshape(-1, token_type_ids.shape[-1]) if token_type_ids is not None else token_type_ids
+            
+            # get output
+            levels_outputs = encoder(
+                flat_input_ids,
+                attention_mask=flat_attention_mask,
+                token_type_ids=flat_token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=True, # if cls.config.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+                return_dict=True,
+            )
+
+            hyperbolic_embedding = self._get_hyperbolic_embedding(flat_attention_mask, levels_outputs) # (bs * num_sent, hidden_size)
+            hyperbolic_embedding = hyperbolic_embedding.reshape(batch_size, -1, hyperbolic_embedding.shape[-1])
+
+
+            # Gather all embeddings if using distributed training
+            if dist.is_initialized() and self.training:
+                he_list = [torch.zeros_like(hyperbolic_embedding) for _ in range(dist.get_world_size())]
                 
                 # Allgather
-                dist.all_gather(tensor_list=he_list, tensor=he.contiguous())
+                dist.all_gather(tensor_list=he_list, tensor=hyperbolic_embedding.contiguous())
 
                 # Since allgather results do not have gradients, we replace the
                 # current process's corresponding embeddings with original tensors
-                he_list[dist.get_rank()] = he
+                he_list[dist.get_rank()] = hyperbolic_embedding
 
-                levels_hyperbolic_embedding[level] = torch.cat(he_list, dim=0)
-
-        levels_hyperbolic_similarity = []
-        loss_fn = nn.CrossEntropyLoss()
-        loss1 = torch.tensor(0.).to(levels_hyperbolic_embedding[0].device)
-        loss2 = torch.tensor(0.).to(levels_hyperbolic_embedding[0].device)
-        loss3 = torch.tensor(0.).to(levels_hyperbolic_embedding[0].device)
-        loss1_count = 0
-        loss2_count = 0
-        he_base: torch.Tensor = levels_hyperbolic_embedding[0] # (batch_size, hidden_size)
-        last_adj_dist: torch.Tensor = None
-        adj_dist_diffs = []
-        if self.hierarchy_type.count('dropout'):
-            for level in range(1, num_sent):
-                he1: torch.Tensor = levels_hyperbolic_embedding[level - 1] # (batch_size, hidden_size)
-                he2: torch.Tensor = levels_hyperbolic_embedding[level] # (batch_size, hidden_size)
-
-                # old l1: positive&negative from previous level
-                hyperbolic_similarity = self.similarity(he1.unsqueeze(1), he2.unsqueeze(0)) # (bs, bs)
-                levels_hyperbolic_similarity.append(hyperbolic_similarity)
-                labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
-                loss1 += loss_fn(hyperbolic_similarity, labels)
-                loss1_count += 1
-
-                '''# new l1: negative from level 0, positive from previous level
-                he1_tmp = he_base.expand(he_base.shape[0], he_base.shape[0], he_base.shape[1]) # (bs, bs, hs)
-                he1_tmp = torch.diagonal_scatter(he1_tmp, he1.transpose(0, 1)) # (bs, bs, hs)
-                hyperbolic_similarity = self.similarity(he2.unsqueeze(1), he1_tmp)
-                levels_hyperbolic_similarity.append(hyperbolic_similarity)
-                labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
-                loss += loss_fn(hyperbolic_similarity, labels)
-                '''
-
-                margin_0 = 5e-3 # fixed margin
-                '''# old l2: make previous level embeddings farther from origin than present level embeddings.
-                if level > 1: # first 2 levels can be seen as the same level.
-                    he1_dist = Manifold.dist0(he1)
-                    he2_dist = Manifold.dist0(he2)
-                    loss2 += torch.logsumexp(
-                        torch.cat(
-                            [torch.zeros((1,), dtype=he1_dist.dtype, device=he1_dist.device), (he2_dist - he1_dist + margin_0)],
-                            dim=0
-                        # ), 
-                        ) / (self.temp),
-                        0
-                    )
-                    loss2_count += 1
-                '''
-                # new l2
-                if level > 1:
-                    he1_dist = Manifold.dist0(he1)
-                    he2_dist = Manifold.dist0(he2)
-                    # loss2 += F.relu(he2_dist - he1_dist + self.level_diffs[level - 2]).mean() # dynamic
-                    loss2 += F.relu(he2_dist - he1_dist + margin_0).mean() # static
-                    loss2_count += 1
-
-                '''# l3
-                adj_dist = Manifold.dist(he_base, he2, dim=-1)
-                if level > 1:
-                    adj_dist_diffs.append(last_adj_dist - adj_dist)
-                last_adj_dist = adj_dist
-                '''
-            margin_1 = 5e-3
-            '''# l3 logsumexp
-            if adj_dist_diffs:
-                adj_dist_diffs = torch.cat(adj_dist_diffs, dim=-1)
-                loss3 = torch.logsumexp(
-                    torch.cat([torch.zeros((adj_dist_diffs.shape[0], 1), dtype=adj_dist_diffs.dtype, device=adj_dist_diffs.device),
-                               (adj_dist_diffs + margin_1) / self.temp], dim=-1),
-                    dim=-1
-                ).mean()
-            '''
-            # l3 triplet
-            # if adj_dist_diffs:
-            #     triplet_score = torch.stack([adj_dist_diffs[l - 1] - adj_dist_diffs[l] + margin_1
-            #                                 for l in range(1, len(adj_dist_diffs))], dim=-1)
-            #     loss3 = triplet_score.mean(dim=-1).mean() # TODO: use mean(dim=-1) or max(dim=-1)
-
-
+                hyperbolic_embedding = torch.cat(he_list, dim=0)
+            # L1
+            local_hyperbolic_similarity = self.similarity(hyperbolic_embedding[:, :, None, :], 
+                                                          hyperbolic_embedding[:, None, :, :],
+                                                         ) # shape of [bs, num_sent, num_sent]
             
+            loss1 = torch.tensor(0.).to(self.device)
+            loss1_count = 0
+            for sent_i in range(batch_size):
+                for l_p in loss_pair[sent_i]:
+                    # logsigmoid
+                    loss1 += -F.logsigmoid((local_hyperbolic_similarity[sent_i, l_p[0], l_p[1]] - 
+                                            local_hyperbolic_similarity[sent_i, l_p[2], l_p[3]]) / 750)
+                                        #   local_hyperbolic_similarity[sent_i, l_p[2], l_p[3]]) / self.temp) # TODO: decide temp
+                    
+                    '''# triplet
+                    margin_2 = 5e-6
+                    loss1 += F.relu(margin_2 + \
+                                    local_hyperbolic_similarity[sent_i, l_p[2], l_p[3]] - \
+                                    local_hyperbolic_similarity[sent_i, l_p[0], l_p[1]])
+                    '''
+                    loss1_count += 1
+            if loss1_count:
+                loss1 /= loss1_count
 
-        if self.hierarchy_type.count('mixup'):
-            pass
+            # L2
+            global_hyperbolic_similarity = self.similarity(hyperbolic_embedding[:, :1], \
+                                                           hyperbolic_embedding[None, :, 1],# FIXME: change to 0
+                                                          ) # shape of [bs, bs]
+            global_hyperbolic_similarity = torch.diagonal_scatter(global_hyperbolic_similarity, 
+                                                                  local_hyperbolic_similarity[:, 0, -1])
+            # contrastive-like loss for L2
+            loss2 = F.cross_entropy(
+                        global_hyperbolic_similarity / self.temp, 
+                        torch.arange(global_hyperbolic_similarity.shape[0]).to(
+                            dtype=torch.long, device=self.device
+                        )
+                    )
 
-        loss = torch.tensor(0.).to(device=levels_hyperbolic_embedding[0].device)
-        if loss1_count:
-            loss1 /= loss1_count
+            # loss accumulation
+            loss = torch.tensor(0.).to(device=self.device)
+
             self.loss_logs['loss1'].append(loss1.item())
-            loss += loss1
-        if loss2_count:
-            loss2 /= loss2_count
+            loss += loss1 # FIXME
+
             self.loss_logs['loss2'].append(loss2.item())
             loss += loss2
-        if loss3:
-            loss += loss3
-            self.loss_logs['loss3'].append(loss3.item())
-        self.loss_logs['loss_all'].append(loss.item())
-        
-        levels_hyperbolic_similarity = torch.cat(levels_hyperbolic_similarity, dim=0)
+
+            self.loss_logs['loss_all'].append(loss.item())
+
+            levels_hyperbolic_similarity = (local_hyperbolic_similarity, global_hyperbolic_similarity)
+
 
         if len(self.loss_logs['loss_all']) % 125 == 1:
             self.display_loss('avg')
 
         if not return_dict:
-            output = (levels_hyperbolic_similarity,) + levels_outputs[2:]
+            output = (levels_hyperbolic_similarity,) + \
+                (levels_outputs.get("hidden_states", None), levels_outputs.get("attentions", None))
             return ((loss,) + output) if loss is not None else output
         return SequenceClassifierOutput(
             loss=loss,
@@ -429,6 +492,7 @@ class InitAndForward:
         head_mask=None,
         inputs_embeds=None,
         labels=None,
+        loss_pair=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None
@@ -476,6 +540,8 @@ class InitAndForward:
         )
 
     def display_loss(self, mode: Union[int, str]):
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
         if mode == 'avg':
             logger.info("Average loss:\n{}".format(
                 {k: sum(v) / len(v) for k, v in self.loss_logs.items() if v}
@@ -491,7 +557,8 @@ class InitAndForward:
             logger.error(f"Can not display loss in mode {mode}")
 
     def custom_param_init(self, config: Union[BertHyperConfig, RobertaHyperConfig]):
-        logger.info(f'{config.num_layers} layers of Bert/Roberta are used for trainning.')
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info(f'{config.num_layers} layers of Bert/Roberta are used for trainning.')
         unfreeze_layers = ['pooler'] + [f'layer.{11 - i}' for i in range(config.num_layers)]
         encoder = self.bert if hasattr(self, 'bert') else self.roberta
         for name, param in encoder.named_parameters():
@@ -515,6 +582,7 @@ class InitAndForward:
             head_mask=None,
             inputs_embeds=None,
             labels=None,
+            loss_pair=None,
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
@@ -530,6 +598,7 @@ class InitAndForward:
                 head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
                 labels=labels,
+                loss_pair=loss_pair,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
