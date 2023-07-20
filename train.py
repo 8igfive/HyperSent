@@ -42,7 +42,7 @@ from hypersent.models import RobertaForHyper, BertForHyper, RobertaHyperConfig, 
 from hypersent.trainers import HyperTrainer, GenerateEmbeddingCallback
 from hypersent.utils import (
     ModelArguments, DataTrainingArguments, OurTrainingArguments, 
-    DatasetType, PrepareFeatures, OurDataCollatorWithPadding
+    PrepareFeatures, OurDataCollatorWithPadding
 )
 
 # logger = logging.getLogger(__name__) # logging
@@ -126,6 +126,8 @@ def main():
     extension = data_args.train_file.split(".")[-1]
     if extension == "txt":
         extension = "text"
+    elif extension == 'jsonl':
+        extension = 'json'
     if extension == "csv":
         datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ",")
     else:
@@ -143,6 +145,7 @@ def main():
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
+        "disable_hyper": model_args.disable_hyper
     }
     if model_args.pooler_type:
         config_kwargs['pooler_type'] = model_args.pooler_type
@@ -200,28 +203,22 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
     
     column_names = datasets["train"].column_names
-    if len(column_names) == 2:
-        # Pair datasets
-        dataset_type = DatasetType.PairDataset
-    elif len(column_names) == 3:
-        # Pair datasets with hard negatives
-        dataset_type = DatasetType.PairDatasetWithHN
-    elif len(column_names) == 1:
-        # Unsupervised datasets
-        dataset_type = DatasetType.UnsupervisedDataset
-    else:
-        raise NotImplementedError
-
-    if training_args.do_train:
-        train_dataset = datasets["train"].map(
-            PrepareFeatures(column_names, dataset_type, tokenizer, data_args, training_args),
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
+    # if training_args.do_train:
+    prepare_features = PrepareFeatures(column_names, tokenizer, data_args, training_args)
+    train_dataset = datasets["train"]
+    if data_args.only_aigen:
+        train_dataset = train_dataset.filter(lambda raw: raw['split'] == 'aigen')
+    train_dataset = train_dataset.map(
+        prepare_features,
+        batched=True,
+        num_proc=data_args.preprocessing_num_workers,
+        remove_columns=column_names,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
     
-    data_collator = default_data_collator if data_args.pad_to_max_length else OurDataCollatorWithPadding(tokenizer)
+    data_collator = default_data_collator if data_args.pad_to_max_length \
+        else OurDataCollatorWithPadding(tokenizer, aigen=('aigen' in training_args.hierarchy_type), 
+                                        aigen_sent_num=len(prepare_features.aigen_keys))
 
     trainer = HyperTrainer(
         model=model,

@@ -365,6 +365,12 @@ class ModelArguments:
             "choices": ["cls", "avg", "avg.with_special_tokens"]
         }
     )
+    disable_hyper: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to disable hyper mode."
+        }
+    )
     hyperbolic_size: int = field(
         default=None,
         metadata={
@@ -415,6 +421,12 @@ class DataTrainingArguments:
         default=None, 
         metadata={"help": "The validation data file (.txt or .csv)."}
     )
+    only_aigen: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to train with `aigen` data only. "
+        },
+    )
     max_seq_length: Optional[int] = field(
         default=32,
         metadata={
@@ -436,7 +448,7 @@ class DataTrainingArguments:
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
+                assert extension in ["csv", "json", "txt", "jsonl"], "`train_file` should be a csv, a json(l) or a txt file."
 
 
 @dataclass
@@ -446,7 +458,7 @@ class OurTrainingArguments(TrainingArguments):
         default="dropout",
         metadata={
             "help": "Hierarchy type for training embeddings in hyperbolic space.",
-            "choices": ["dropout", "cluster", "token_cutoff"]
+            "choices": ["dropout", "cluster", "token_cutoff", "aigen"]
         }
     )
 
@@ -475,16 +487,10 @@ class OurTrainingArguments(TrainingArguments):
     )
 
 # Prepare features
-class DatasetType(Enum):
-    PairDataset = "pair_dataset"
-    PairDatasetWithHN = "pair_dataset_with_hard_negatives"
-    UnsupervisedDataset = "unsupervised_dataset"
-
 @dataclass
 class PrepareFeatures:
 
     column_names: List[str]
-    dataset_type: DatasetType
     tokenizer: PreTrainedTokenizerBase
     data_args: DataTrainingArguments
     training_args: OurTrainingArguments
@@ -500,7 +506,7 @@ class PrepareFeatures:
 
         total = len(examples[self.column_names[0]])
 
-        if self.dataset_type == DatasetType.UnsupervisedDataset:
+        if len(self.column_names) == 1: # Unsupervised
             sent_name = self.column_names[0]
             
             # Avoid "None" fields 
@@ -565,6 +571,41 @@ class PrepareFeatures:
                     print(features['loss_pair'][-1])
                     pdb.set_trace()
                     '''
+        
+        elif len(self.column_names) == 8: # AIGEN
+            
+            sentences = []
+            if not hasattr(self, 'aigen_keys'): # check which key to use
+                self.aigen_keys = []
+
+            for idx in range(total):
+                if examples['split'][idx] == 'aigen': # FIXME: change to aigen
+                    if len(self.aigen_keys) == 0: # check which key to use
+                        for key in ['sentence', '5', '4', '3', '2', '1', '0']:
+                            if examples[key][idx] != '':
+                                self.aigen_keys.append(key)
+                    for key in self.aigen_keys:
+                        sentences.append(examples[key][idx] if examples[key][idx] is not None else ' ')
+            assert len(sentences) == 0 or len(sentences) % len(self.aigen_keys) == 0
+            gen_group_num = (0 if len(sentences) == 0 else len(sentences) // len(self.aigen_keys))
+            for idx in range(total):
+                if examples['split'][idx] == 'other':
+                    sentences.append(examples['sentence'][idx] if examples['sentence'][idx] is not None else ' ')
+
+            sent_features = self.tokenizer(
+                sentences,
+                max_length=self.data_args.max_seq_length,
+                truncation=True,
+                padding="max_length" if self.data_args.pad_to_max_length else False,
+            )
+
+            features = {key: [] for key in sent_features.keys()}
+            for idx in range(gen_group_num):
+                for key in features.keys():
+                    features[key].append(sent_features[key][idx * len(self.aigen_keys): (idx + 1) * len(self.aigen_keys)])
+            for idx in range(gen_group_num * len(self.aigen_keys), len(sentences)):
+                for key in features.keys():
+                    features[key].append([sent_features[key][idx]] * 2)
         else:
             raise NotImplementedError
         
@@ -605,41 +646,75 @@ class PrepareFeatures:
 class OurDataCollatorWithPadding:
 
     tokenizer: PreTrainedTokenizerBase
+    aigen: bool = False
     padding: Union[bool, str, PaddingStrategy] = True
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
     # mlm: bool = True
     # mlm_probability: float = data_args.mlm_probability
+    aigen_sent_num: int = 0
 
     def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
         drop_keys = ['loss_pair']
-        bs = len(features)
-        if bs > 0:
-            num_sent = len(features[0]['input_ids'])
+
+        if self.aigen:
+            flat_features = []
+            gen_num = 0
+            for feature in features:
+                if len(feature['input_ids']) == self.aigen_sent_num: # aigen: among (sentence, 5, 4, 3, 2, 1, 0)
+                    gen_num += 1
+                    for i in range(self.aigen_sent_num):
+                        flat_features.append({k: (v[i] if k in special_keys else v) 
+                                             for k, v in feature.items() if k not in drop_keys})
+            for feature in features:                             
+                if len(feature['input_ids']) == 2: # other
+                    for i in range(2):
+                        flat_features.append({k: (v[i] if k in special_keys else v) 
+                                             for k, v in feature.items() if k not in drop_keys})
+            
+            batch = self.tokenizer.pad(
+                flat_features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors="pt",
+            )
+            # input_ids, attention_mask, token_type_ids：[Tensor of shape(abs, 7, seq_len), Tensor of shape(obs, 2, seq_len)]
+            batch = {k : [v[: gen_num * self.aigen_sent_num], v[gen_num * self.aigen_sent_num: ]] for k, v in batch.items()}
+            for i, sen_num in zip(range(2), [self.aigen_sent_num, 2]):
+                for k, v in batch.items():
+                    if k in special_keys:
+                        v[i] = v[i].reshape((v[i].shape[0] // sen_num if sen_num else 0), sen_num, v[i].shape[1])
+                    else:
+                        v[i] = v[i].reshape((v[i].shape[0] // sen_num if sen_num else 0), sen_num, v[i].shape[1])[:, 0]
         else:
-            return
-        flat_features = []
-        for feature in features:
-            for i in range(num_sent):
-                flat_features.append({k: (feature[k][i] if k in special_keys else feature[k]) 
-                                      for k in feature if k not in drop_keys})
+            bs = len(features)
+            if bs > 0:
+                num_sent = len(features[0]['input_ids'])
+            else:
+                return
+            flat_features = []
+            for feature in features:
+                for i in range(num_sent):
+                    flat_features.append({k: (feature[k][i] if k in special_keys else feature[k]) 
+                                        for k in feature if k not in drop_keys})
 
-        batch = self.tokenizer.pad(
-            flat_features,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors="pt",
-        )
-        # if model_args.do_mlm:
-        #     batch["mlm_input_ids"], batch["mlm_labels"] = self.mask_tokens(batch["input_ids"])
+            batch = self.tokenizer.pad(
+                flat_features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors="pt",
+            )
+            # if model_args.do_mlm:
+            #     batch["mlm_input_ids"], batch["mlm_labels"] = self.mask_tokens(batch["input_ids"])
 
-        batch = {k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0] for k in batch}
+            batch = {k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0] for k in batch}
 
-        for key in drop_keys:
-            if key in features[0]:
-                batch[key] = [feature[key] for feature in features]
+            for key in drop_keys:
+                if key in features[0]:
+                    batch[key] = [feature[key] for feature in features]
 
         if "label" in batch:
             batch["labels"] = batch["label"]

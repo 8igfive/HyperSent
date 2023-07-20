@@ -31,11 +31,11 @@ class MLPLayer(nn.Module):
     'pre': euclidean MLP.
     Default to 'post'.
     """
-    def __init__(self, euclidean_size: int, hyperbolic_size: int, pooler_type: str):
+    def __init__(self, euclidean_size: int, hyperbolic_size: int, disable_hyper: bool):
         super().__init__()
         self.linear = nn.Linear(euclidean_size, hyperbolic_size)
         self.activation = nn.Tanh()
-        self.hyper_output = False if 'pre' in pooler_type else True
+        self.disable_hyper = disable_hyper
 
     def forward(self, features:torch.Tensor, **kwargs) -> torch.Tensor:
         euclidean_features = self.linear(features)
@@ -44,7 +44,7 @@ class MLPLayer(nn.Module):
 
         # pdb.set_trace()
 
-        if self.hyper_output:
+        if not self.disable_hyper:
             return hyperbolic_features
         else:
             return euclidean_features
@@ -54,14 +54,19 @@ class Similarity(nn.Module):
     Hyperbolic Similarity: Dosn't calculate temp now.
     """
 
-    def __init__(self):
+    def __init__(self, disable_hyper: bool):
         super().__init__()
+        self.disable_hyper = disable_hyper
 
     def forward(self, x, y):
-        return -Manifold.dist(x, y, dim=-1)
+        if not self.disable_hyper:
+            return -Manifold.dist(x, y, dim=-1)
+        else:
+            return F.cosine_similarity(x, y, dim=-1)
 
 class BertHyperConfig(BertConfig):
     def __init__(self,
+        disable_hyper: bool = False, 
         pooler_type: str = 'cls',
         hyperbolic_size: int = 768,
         temp: float = 0.05, 
@@ -69,6 +74,7 @@ class BertHyperConfig(BertConfig):
         **kwargs
     ): 
         super().__init__(**kwargs)
+        self.disable_hyper = disable_hyper
         self.pooler_type = pooler_type
         self.hyperbolic_size = hyperbolic_size
         self.temp = temp
@@ -76,6 +82,7 @@ class BertHyperConfig(BertConfig):
 
 class RobertaHyperConfig(RobertaConfig):
     def __init__(self,
+        disable_hyper: bool = False, 
         pooler_type: str = 'cls',
         hyperbolic_size: int = 768,
         temp: float = 0.05, 
@@ -83,6 +90,7 @@ class RobertaHyperConfig(RobertaConfig):
         **kwargs
     ): 
         super().__init__(**kwargs)
+        self.disable_hyper = disable_hyper
         self.pooler_type = pooler_type
         self.hyperbolic_size = hyperbolic_size
         self.temp = temp
@@ -95,15 +103,23 @@ class InitAndForward:
         self.hierarchy_type = hierarchy_type
         self.dropout_change_layers = dropout_change_layers
 
+        self.diable_hyper = config.disable_hyper
         self.pooler_type = config.pooler_type
-        self.mlp = MLPLayer(config.hidden_size, config.hyperbolic_size, self.pooler_type)
-        self.similarity = Similarity()
+        self.mlp = MLPLayer(config.hidden_size, config.hyperbolic_size, config.disable_hyper)
+        self.similarity = Similarity(config.disable_hyper)
         self.temp = config.temp
+
+        self.aigen_input_ids = None
+        self.aigen_attention_mask = None
+        self.aigen_token_type_ids = None
 
         self.level_diffs = None
         self.loss_logs = {'loss_all': [], 'loss1': [], 'loss2': [], 'loss3': [], 'loss4': []}
 
-    def _avg_embedding(self, attention_mask: torch.Tensor, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _avg_embedding(
+        self, attention_mask: torch.Tensor, outputs: Dict[str, torch.Tensor],
+        with_mlp: bool = True
+    ) -> torch.Tensor:
         last_hidden: torch.Tensor = outputs.last_hidden_state # (bs, seq_len, hidden_len)
         hidden_states: torch.Tensor = outputs.hidden_states  # Tuple of (bs, seq_len, hidden_len)
 
@@ -111,7 +127,10 @@ class InitAndForward:
         with_sep = True if 'with_special_tokens' in self.pooler_type else 'with_sep' in self.pooler_type
 
         last_hidden = last_hidden * attention_mask.unsqueeze(-1)    # (bs, seq_len, hidden_len)
-        word_hyperbolic_embeddings = self.mlp(last_hidden)  # (bs, seq_len, hidden_len)
+        if with_mlp:
+            word_hyperbolic_embeddings = self.mlp(last_hidden)  # (bs, seq_len, hidden_len)
+        else:
+            word_hyperbolic_embeddings = last_hidden
         masked_seq_len = attention_mask.sum(dim=-1).tolist() # (bs)
         
         # 先考虑使用与 CLS 的余弦相似度作为权重
@@ -121,40 +140,52 @@ class InitAndForward:
         sent_hyperbolic_embeddings = []
         for batch_idx, batch_seq_len in enumerate(masked_seq_len):
             sent_hyperbolic_embedding = None
+            embedding_count = 1
             for word_idx in cls_rank[batch_idx]:
                 if word_idx == 0 and not with_cls or \
                     word_idx == batch_seq_len - 1 and not with_sep or \
                     word_idx >= batch_seq_len:
                     continue
                 if sent_hyperbolic_embedding != None:
-                    sent_hyperbolic_embedding = Manifold.mobius_add(
-                        sent_hyperbolic_embedding,
-                        word_hyperbolic_embeddings[batch_idx, word_idx]
-                    )
+                    if not self.disable_hyper and with_mlp:
+                        sent_hyperbolic_embedding = Manifold.mobius_add(
+                            sent_hyperbolic_embedding,
+                            word_hyperbolic_embeddings[batch_idx, word_idx]
+                        )
+                    else:
+                        sent_hyperbolic_embedding += word_hyperbolic_embeddings[batch_idx, word_idx]
+                    embedding_count += 1
                 else:
                     sent_hyperbolic_embedding = word_hyperbolic_embeddings[batch_idx, word_idx]
-            # FIXME
+
             if sent_hyperbolic_embedding is None:
                 # print(batch_idx, batch_seq_len)
                 # print(cls_rank[batch_idx])
                 # print(word_hyperbolic_embeddings[batch_idx])
                 # Nonetype for the batch_seq_len=2, take the [cls] embedding for sent_hyperbolic_embedding
                 sent_hyperbolic_embedding = word_hyperbolic_embeddings[batch_idx, 0]
+            if self.disable_hyper:
+                sent_hyperbolic_embedding /= embedding_count
             sent_hyperbolic_embeddings.append(sent_hyperbolic_embedding)
 
         sent_hyperbolic_embeddings = torch.stack(sent_hyperbolic_embeddings, dim=0)
         return sent_hyperbolic_embeddings # (bs, hidden_len)
 
-    def _get_hyperbolic_embedding(self, attention_mask: torch.Tensor, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _get_hyperbolic_embedding(
+        self, attention_mask: torch.Tensor, outputs: Dict[str, torch.Tensor],
+        with_mlp: bool = True
+    ) -> torch.Tensor:
         last_hidden: torch.Tensor = outputs.last_hidden_state # (bs, seq_len, hidden_len)
         hidden_states: torch.Tensor = outputs.hidden_states  # Tuple of (bs, seq_len, hidden_len)
 
         if 'cls' in self.pooler_type:
             cls_embedding = last_hidden[:, 0]
-            hyperbolic_sentence_embedding = self.mlp(cls_embedding)
-            return hyperbolic_sentence_embedding #(bs, hidden_len)
+            if with_mlp:
+                return self.mlp(cls_embedding) #(bs, hidden_len)
+            else:
+                return cls_embedding
         elif 'avg' in self.pooler_type: 
-            return self._avg_embedding(attention_mask, outputs)
+            return self._avg_embedding(attention_mask, outputs, with_mlp=with_mlp)
             # return self._avg_embedding_deprecated(attention_mask, outputs)
         else:
             raise NotImplementedError
@@ -192,8 +223,13 @@ class InitAndForward:
     ) -> SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         ori_input_ids = input_ids
-        batch_size = input_ids.size(0)
-        num_sent = input_ids.size(1) # level num
+        if self.hierarchy_type.count("aigen"):
+            aigen_batch_size = input_ids[0].size(0)
+            aigen_sent_num = input_ids[0].size(1)
+            other_batch_size = input_ids[1].size(0)
+        else:
+            batch_size = input_ids.size(0)
+            num_sent = input_ids.size(1) # level num
 
         if self.hierarchy_type.count("dropout") or self.hierarchy_type.count("mixup"):
             # init self.level_diffs
@@ -467,11 +503,160 @@ class InitAndForward:
             self.loss_logs['loss_all'].append(loss.item())
 
             levels_hyperbolic_similarity = (local_hyperbolic_similarity, global_hyperbolic_similarity)
+        
+        elif self.hierarchy_type.count("aigen"):
+            
+            if input_ids[0].shape[0] > 0: # FIXME: for large aigen
+                acc_flag = False
+                if self.aigen_input_ids is None:
+                    self.aigen_input_ids = input_ids[0]
+                    self.aigen_attention_mask = attention_mask[0]
+                    self.aigen_token_type_ids = token_type_ids[0]
+                    acc_flag = True
+                else:
+                    if input_ids[0].shape[-1] == self.aigen_input_ids.shape[-1]:
+                        self.aigen_input_ids = torch.cat([self.aigen_input_ids, input_ids[0]], dim=0)
+                        self.aigen_attention_mask = torch.cat([self.aigen_attention_mask, attention_mask[0]])
+                        self.aigen_token_type_ids = torch.cat([self.aigen_token_type_ids, token_type_ids[0]])
+                        acc_flag = True
+                if acc_flag:
+                    if self.aigen_input_ids.shape[0] >= 1: # 32
+                        input_ids[0] = self.aigen_input_ids
+                        attention_mask[0] = self.aigen_attention_mask
+                        token_type_ids[0] = self.aigen_token_type_ids
+                        self.aigen_input_ids = None
+                        self.aigen_attention_mask = None
+                        self.aigen_token_type_ids = None
+                    else:
+                        input_ids[0] = input_ids[0][:0]
+                        attention_mask[0] = attention_mask[0][:0]
+                        token_type_ids[0] = token_type_ids[0][:0]
+                aigen_batch_size = input_ids[0].size(0)
+                aigen_sent_num = input_ids[0].size(1)
+                other_batch_size = input_ids[1].size(0)
 
+            inp_input_ids = torch.cat([input_ids[0].reshape(-1, input_ids[0].shape[-1]), 
+                                       input_ids[1].reshape(-1, input_ids[1].shape[-1])], dim=0) # shape of [abs * aigen_sent_num + obs * 2, seq_len]
+            inp_attention_mask = torch.cat([attention_mask[0].reshape(-1, attention_mask[0].shape[-1]),
+                                            attention_mask[1].reshape(-1, attention_mask[1].shape[-1])], dim=0)
+            inp_token_type_ids = torch.cat([token_type_ids[0].reshape(-1, token_type_ids[0].shape[-1]),
+                                            token_type_ids[1].reshape(-1, token_type_ids[1].shape[-1])], dim=0)
 
+            # Get raw embeddings
+            outputs = encoder(
+                inp_input_ids,
+                attention_mask=inp_attention_mask,
+                token_type_ids=inp_token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=True, # if cls.config.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+                return_dict=True,
+            )
+
+            hyperbolic_embedding = self._get_hyperbolic_embedding(inp_attention_mask, outputs) # (abs * aigen_sent_num + obs * 2, hidden_size)
+
+            if dist.is_initialized() and self.training:
+                raise NotImplementedError # FIXME unavailable when abs and obs are not fixed between batches.
+
+            aigen_h_embedding = hyperbolic_embedding[:aigen_batch_size * aigen_sent_num].reshape(aigen_batch_size, aigen_sent_num, hyperbolic_embedding.shape[-1])
+            other_h_embedding = hyperbolic_embedding[aigen_batch_size * aigen_sent_num:].reshape(other_batch_size, 2, hyperbolic_embedding.shape[-1])
+            temp1, temp2, temp3 = self.temp, 5e-2, 5e-3 # FIXME: decide temp
+
+            if other_batch_size > 0:
+                # loss1: CrossEntropy or InforNCE
+                loss1_fn = nn.CrossEntropyLoss()
+                embeds_0 = other_h_embedding[:, :1] # (obs, 1, hidden_size)
+                embeds_1 = torch.cat([other_h_embedding[:, 1], 
+                                    #   aigen_h_embedding.reshape(aigen_batch_size * aigen_sent_num, 
+                                      aigen_h_embedding[:, :1].reshape(aigen_batch_size * 1, # FIXME 
+                                      hyperbolic_embedding.shape[-1])], dim=0).unsqueeze(0) # (1, obs + abs * asn, hidden_size)
+                # embeds_1 = other_h_embedding[None, :, 1] # FIXME
+                hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (obs, obs + abs * asn)
+                labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                loss1 = loss1_fn(hyperbolic_similarity / temp1, labels)
+            else:
+                loss1 = None
+            
+            
+            if aigen_batch_size > 0:
+                # loss2: CrossEntropy or InforNCE
+                loss2_fn = nn.CrossEntropyLoss()
+                loss2 = torch.tensor(0., device=self.device)
+                aigen_pos_sent_num = 1 # FIXME
+                embeds_0 = aigen_h_embedding[:, :1] # (abs, 1, hidden_size)
+                for aigen_pos_idx in range(1, aigen_pos_sent_num + 1):
+                    # TODO: 是否要增加其他 aigen 的所有句子作为负例？
+                    # 无 aigen 负例
+                    embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
+                    # embeds_1 = torch.cat([aigen_h_embedding[:, 2], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # FIXME
+                    # aigen 得分最低的作为负例
+                    # embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, 2 * abs + obs, hidden_size)
+                    hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (abs, obs + abs)
+                    labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                    loss2 += loss2_fn(hyperbolic_similarity / temp2, labels)
+                loss2 /= aigen_pos_sent_num
+
+                # loss3
+                levels_sim = []
+                embeds_0 = aigen_h_embedding[:, 0]
+                for level in range(1, aigen_sent_num):
+                    embeds_1 = aigen_h_embedding[:, level]
+                    levels_sim.append(self.similarity(embeds_0, embeds_1))
+                levels_sim = torch.stack(levels_sim, dim=-1)
+
+                # option0: KL divergence, for KLD, input should be log_p, and target should be p, and reduction should be 'batchmean'
+                # consider cross_entropy, input should be logits, target should be p
+                # loss3_fn = nn.KLDivLoss(reduction='batchmean')
+                # target = torch.softmax(torch.tensor([[5, 4, 3, 2, 1, 0.5][:aigen_sent_num - 1]]).to(dtype=torch.float, device=self.device), dim=-1)
+                # loss3 = loss3_fn(torch.log_softmax(levels_sim / temp3, dim=-1), target.expand_as(levels_sim))
+
+                # option1: pair_wise
+                # loss3_fn = F.logsigmoid # logsigmoid
+                loss3_fn = F.relu # triplet
+                loss3 = torch.tensor(0., device=self.device)
+                # simple
+                if aigen_sent_num - 2:
+                    for idx in range(aigen_sent_num - 2):
+                        # loss3 -= loss3_fn((levels_sim[:, idx] - levels_sim[:, idx + 1]) / temp3).mean() # logsigmoid
+                        loss3 += loss3_fn(levels_sim[:, idx + 1] - levels_sim[:, idx] + temp3).mean() # triplet
+                    loss3 /= (aigen_sent_num - 2)
+                # # complex
+                # for idx_0 in range(aigen_sent_num - 2):
+                #     for idx_1 in range(idx_0 +1, aigen_sent_num - 1):
+                #         loss3 -= loss3_fn((levels_sim[:, idx_0] - levels_sim[:, idx_1]) / temp3).mean()
+                # loss3 /= ((aigen_sent_num - 1) * (aigen_sent_num - 2) // 2)
+
+            else:
+                loss2 = None
+                loss3 = None
+
+            loss = torch.tensor(0.).to(self.device)
+            levels_hyperbolic_similarity = None
+            levels_outputs = outputs    # for return
+            if loss2 is not None:
+                beta2 = 0.1 # 0.2 # FIXME
+                beta3 = 0. # 0.6 # FIXME
+                self.loss_logs['loss2'].append(loss2.item())
+                self.loss_logs['loss3'].append(loss3.item())
+                loss += beta2 * loss2 + beta3 * loss3
+                levels_hyperbolic_similarity = levels_sim
+            else:
+                beta2 = 0.
+                beta3 = 0.
+            if loss1 is not None:
+                self.loss_logs['loss1'].append(loss1.item())
+                # loss += (1 - beta2 - beta3) * loss1
+                loss += (1 - beta2) * loss1
+                # loss += loss1
+                if levels_hyperbolic_similarity is None:
+                    levels_hyperbolic_similarity = hyperbolic_similarity
+            self.loss_logs['loss_all'].append(loss.item())
+            
         if len(self.loss_logs['loss_all']) % 125 == 1:
             self.display_loss('avg')
-
+        
         if not return_dict:
             output = (levels_hyperbolic_similarity,) + \
                 (levels_outputs.get("hidden_states", None), levels_outputs.get("attentions", None))
@@ -498,6 +683,12 @@ class InitAndForward:
         return_dict=None
     ) -> BaseModelOutputWithPoolingAndCrossAttentions:
         return_dict: bool = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if isinstance(input_ids, list): # aigen
+            input_ids = torch.cat([input_ids[0].reshape(-1, input_ids[0].shape[-1]), input_ids[1][:, 0]], dim=0)
+            attention_mask = torch.cat([attention_mask[0].reshape(-1, attention_mask[0].shape[-1]), attention_mask[1][:, 0]], dim=0)
+            token_type_ids = torch.cat([token_type_ids[0].reshape(-1, token_type_ids[0].shape[-1]), token_type_ids[1][:, 0]], dim=0)
+        
         paired_data: bool = len(input_ids.shape) == 3
 
         if paired_data:
@@ -513,20 +704,21 @@ class InitAndForward:
                 token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) # (bs * num_sent, len)
         
         # Get raw embeddings
-        outputs = encoder(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=True, # if cls.config.pooler_type in ['avg_top2', 'avg_first_last'] else False,
-            return_dict=True,
-        )
+        with torch.no_grad():
+            outputs = encoder(
+                input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=True, # if cls.config.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+                return_dict=True,
+            )
         
         # Get hyperbolic embeddings
-        hyperbolic_embedding: torch.Tensor = self._get_hyperbolic_embedding(attention_mask, outputs)
+        hyperbolic_embedding: torch.Tensor = self._get_hyperbolic_embedding(attention_mask, outputs, with_mlp=False) # FIXME, with_mlp=True
         if paired_data:
             hyperbolic_embedding = hyperbolic_embedding.view(batch_size, num_sent, hyperbolic_embedding.shape[-1])
 
@@ -603,6 +795,31 @@ class InitAndForward:
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
         )
+
+    def floating_point_ops(
+        self, input_dict: Dict[str, Union[torch.Tensor, Any]], exclude_embeddings: bool = True
+    ) -> int:
+        def _fpo(
+            input_dict: Dict[str, Union[torch.Tensor, Any]], exclude_embeddings: bool = True
+        ) -> int:
+            return 6 * self.estimate_tokens(input_dict) * self.num_parameters(exclude_embeddings=exclude_embeddings)
+        
+        total_fpo = 0.
+        list_len = 0
+        for v in input_dict.values():
+            if isinstance(v, list):
+                list_len = len(v)
+                break
+        
+        if list_len:
+            for i in range(list_len):
+                tmp_inp = {k: (v[i] if isinstance(v, list) else v) for k, v in input_dict.items()}
+                total_fpo += _fpo(tmp_inp, exclude_embeddings)
+        else:
+            total_fpo = _fpo(input_dict, exclude_embeddings)
+        
+        return total_fpo
+            
 
 class BertForHyper(InitAndForward, BertPreTrainedModel):
 

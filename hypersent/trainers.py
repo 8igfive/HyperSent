@@ -146,7 +146,8 @@ class HyperTrainer(Trainer):
         params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
                                             'tenacity': 3, 'epoch_size': 2}
 
-        params['similarity'] = lambda x, y: -Manifold.dist(x, y) # FIXME: poincare or cosine?
+        if not self.model_args.disable_hyper:
+            params['similarity'] = lambda x, y: -Manifold.dist(x, y) # FIXME: poincare or cosine?
 
         se = senteval.engine.SE(params, batcher, prepare)
         tasks = ['STSBenchmark', 'SICKRelatedness']

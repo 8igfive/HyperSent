@@ -85,7 +85,7 @@ def main():
         raise NotImplementedError
 
     # use distance from poincare ball for similarity
-    params['similarity'] = lambda x, y: -Manifold.dist(x, y)
+    # params['similarity'] = lambda x, y: -Manifold.dist(x, y) # FIXME
 
     # SentEval prepare and batcher
     def prepare(params, samples):
