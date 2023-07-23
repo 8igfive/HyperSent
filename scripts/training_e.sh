@@ -4,7 +4,7 @@ mkdir -p results/runs
 
 python train.py \
     --model_name_or_path bert-base-uncased \
-    --train_file data/230718/wiki1m_aigen_remove_20k_2.json \
+    --train_file data/230718/wiki1m_aigen_remove_20k_3.json \
     --max_seq_length 32 \
     --evaluation_strategy steps \
     --metric_for_best_model stsb_spearman \

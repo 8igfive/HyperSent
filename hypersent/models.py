@@ -223,6 +223,7 @@ class InitAndForward:
     ) -> SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         ori_input_ids = input_ids
+
         if self.hierarchy_type.count("aigen"):
             aigen_batch_size = input_ids[0].size(0)
             aigen_sent_num = input_ids[0].size(1)
@@ -520,7 +521,7 @@ class InitAndForward:
                         self.aigen_token_type_ids = torch.cat([self.aigen_token_type_ids, token_type_ids[0]])
                         acc_flag = True
                 if acc_flag:
-                    if self.aigen_input_ids.shape[0] >= 1: # 32
+                    if self.aigen_input_ids.shape[0] >= 64: # 32
                         input_ids[0] = self.aigen_input_ids
                         attention_mask[0] = self.aigen_attention_mask
                         token_type_ids[0] = self.aigen_token_type_ids
@@ -636,7 +637,7 @@ class InitAndForward:
             levels_hyperbolic_similarity = None
             levels_outputs = outputs    # for return
             if loss2 is not None:
-                beta2 = 0.1 # 0.2 # FIXME
+                beta2 = 0.4 # 0.2 # FIXME
                 beta3 = 0. # 0.6 # FIXME
                 self.loss_logs['loss2'].append(loss2.item())
                 self.loss_logs['loss3'].append(loss3.item())

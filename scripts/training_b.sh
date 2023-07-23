@@ -10,9 +10,9 @@ python train.py \
     --metric_for_best_model stsb_spearman \
     --load_best_model_at_end \
     --eval_steps 125 \
-    --learning_rate 5e-5 \
-    --num_train_epochs 3 \
-    --per_device_train_batch_size 384 \
+    --learning_rate 3e-5 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 128 \
     --temp 0.05 \
     --num_layers 12 \
     --pooler_type cls \
