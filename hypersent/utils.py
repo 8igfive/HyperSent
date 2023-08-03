@@ -362,7 +362,7 @@ class ModelArguments:
         default=None,
         metadata={
             "help": "What kind of pooler to use.",
-            "choices": ["cls", "avg", "avg.with_special_tokens"]
+            "choices": ["cls", "avg", "avg.with_special_tokens", "mask"]
         }
     )
     disable_hyper: bool = field(
@@ -653,12 +653,51 @@ class OurDataCollatorWithPadding:
     # mlm: bool = True
     # mlm_probability: float = data_args.mlm_probability
     aigen_sent_num: int = 0
+    aigen_batch_size: int = 64
+    combine_training: bool = False
+    aigen_features_cache = []
+    other_features_cache = []
 
     def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
         drop_keys = ['loss_pair']
 
         if self.aigen:
+            
+            batch_size = len(features)
+            for feature in features:
+                if len(feature['input_ids']) == self.aigen_sent_num:
+                    self.aigen_features_cache.append(feature)
+                else:
+                    self.other_features_cache.append(feature)
+
+            # new
+            # if len(self.aigen_features_cache) >= self.aigen_batch_size:
+            #     features = self.aigen_features_cache[:self.aigen_batch_size]
+            #     self.aigen_features_cache = self.aigen_features_cache[self.aigen_batch_size: ]
+            #     if self.combine_training and self.aigen_batch_size < batch_size:
+            #         other_batch_size = batch_size - self.aigen_batch_size
+            #         features += self.other_features_cache[:other_batch_size]
+            #         self.other_features_cache = self.other_features_cache[other_batch_size: ]
+            # else:
+            #     if self.combine_training:
+            #         features = self.other_features_cache[:batch_size]
+            #         self.other_features_cache = self.other_features_cache[batch_size:]
+            #     else:
+            #         features = self.other_features_cache
+            #         self.other_features_cache = []
+
+            # old: when testing old version, change to this
+            if len(self.aigen_features_cache) >= self.aigen_batch_size:
+                features = self.aigen_features_cache
+                self.aigen_features_cache = []
+                if self.combine_training:
+                    features += self.other_features_cache
+                    self.other_features_cache = []
+            else:
+                features = self.other_features_cache
+                self.other_features_cache = []
+
             flat_features = []
             gen_num = 0
             for feature in features:
@@ -760,3 +799,8 @@ class OurDataCollatorWithPadding:
         # The rest of the time (10% of the time) we keep the masked input tokens unchanged
         return inputs, labels
     '''
+
+def print_example(example):
+    for key in ['sentence'] + [str(i) for i in range(5, 0, -1)]:
+        if example[key]:
+            print(example[key] + '\n')

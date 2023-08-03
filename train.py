@@ -218,7 +218,8 @@ def main():
     
     data_collator = default_data_collator if data_args.pad_to_max_length \
         else OurDataCollatorWithPadding(tokenizer, aigen=('aigen' in training_args.hierarchy_type), 
-                                        aigen_sent_num=len(prepare_features.aigen_keys))
+                                        aigen_sent_num=len(prepare_features.aigen_keys), 
+                                        aigen_batch_size=64, combine_training=True)
 
     trainer = HyperTrainer(
         model=model,

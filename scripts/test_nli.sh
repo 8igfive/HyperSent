@@ -3,13 +3,14 @@
 mkdir -p results/runs
 
 python train.py \
-    --model_name_or_path /home/LAB/limx/download/model/bert-base-uncased \
-    --train_file data/230802/nli20k_aigen_sts_3.json \
+    --model_name_or_path bert-base-uncased \
+    --train_file data/230727/wiki1m_nli_20k_2.json \
     --max_seq_length 32 \
     --evaluation_strategy steps \
     --metric_for_best_model sickr_spearman \
     --load_best_model_at_end \
-    --eval_steps 125 \
+    --save_steps 125 \
+    --logging_steps 125 \
     --learning_rate 1e-5 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 256 \
@@ -18,7 +19,7 @@ python train.py \
     --pooler_type mask \
     --hyperbolic_size 768 \
     --model_type bert \
-    --output_dir results/runs/test_training_d \
+    --output_dir results/runs/test_nli \
     --hierarchy_type aigen \
     --disable_hyper \
     --hierarchy_levels 3\

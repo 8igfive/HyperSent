@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from functools import reduce
 
 from transformers.utils import logging
 from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel
@@ -187,6 +188,16 @@ class InitAndForward:
         elif 'avg' in self.pooler_type: 
             return self._avg_embedding(attention_mask, outputs, with_mlp=with_mlp)
             # return self._avg_embedding_deprecated(attention_mask, outputs)
+        elif 'mask' in self.pooler_type:
+            mask_embedding = []
+            sent_len = attention_mask.sum(dim=-1) 
+            for idx in range(last_hidden.shape[0]):
+                mask_embedding.append(last_hidden[idx][sent_len[idx] - 2])
+            mask_embedding = torch.stack(mask_embedding, dim=0)
+            if with_mlp:
+                return self.mlp(mask_embedding) #(bs, hidden_len)
+            else:
+                return mask_embedding
         else:
             raise NotImplementedError
 
@@ -208,6 +219,119 @@ class InitAndForward:
         euclidean_norms = [hn2en(max_hyperbolic_norm * 0.9 * 0.7 ** level) for level in range(level_num - 1)]
         self.level_diffs = [euclidean_norms[i] - euclidean_norms[i + 1] for i in range(level_num - 2)]
 
+    def add_prompt(self, input_ids, token_type_ids, attention_mask):
+        def _add_prompt(prompt, input_ids, token_type_ids, attention_mask):
+            sent_len = attention_mask.sum(dim=-1)
+            n_input_ids = []
+            if token_type_ids is not None:
+                n_token_type_ids = []
+            n_attention_mask = []
+            for s_idx in range(input_ids.shape[0]):
+                n_input_ids.append(torch.cat([input_ids[s_idx][:1], prompt['input_ids'][0].to(input_ids[s_idx][:1]), 
+                    input_ids[s_idx][1:sent_len[s_idx] - 1], prompt['input_ids'][1].to(input_ids[s_idx][:1]), 
+                    input_ids[s_idx][sent_len[s_idx] - 1: ]], dim=0))
+                if token_type_ids is not None:
+                    n_token_type_ids.append(torch.cat([token_type_ids[s_idx][:1], prompt['token_type_ids'][0].to(token_type_ids[s_idx][:1]), 
+                        token_type_ids[s_idx][1:sent_len[s_idx] - 1], prompt['token_type_ids'][1].to(token_type_ids[s_idx][:1]), 
+                        token_type_ids[s_idx][sent_len[s_idx] - 1: ]], dim=0))
+                n_attention_mask.append(torch.cat([attention_mask[s_idx][:1], prompt['attention_mask'][0].to(attention_mask[s_idx][:1]),
+                    attention_mask[s_idx][1:sent_len[s_idx] - 1], prompt['attention_mask'][1].to(attention_mask[s_idx][:1]), 
+                    attention_mask[s_idx][sent_len[s_idx] - 1: ]], dim=0))
+            n_input_ids = torch.stack(n_input_ids, dim=0)
+            if token_type_ids is not None:
+                n_token_type_ids = torch.stack(n_token_type_ids, dim=0)
+            else:
+                n_token_type_ids = None
+            n_attention_mask = torch.stack(n_attention_mask, dim=0)
+            return n_input_ids, n_token_type_ids, n_attention_mask
+        
+        if isinstance(input_ids, list):
+
+            if input_ids[0].shape[0] > 0:
+                n_input_ids0 = []
+                if token_type_ids[0] is not None:
+                    n_token_type_ids0 = []
+                n_attention_mask0 = []
+                for idx1 in range(input_ids[0].shape[1]):
+                    r_input_ids, r_token_type_ids, r_attention_mask = _add_prompt(
+                        self.prompt[0], input_ids[0][:, idx1], token_type_ids[0][:, idx1] if token_type_ids[0] is not None else None,
+                        attention_mask[0][:, idx1]
+                    )
+                    n_input_ids0.append(r_input_ids)
+                    if token_type_ids[0] is not None:
+                        n_token_type_ids0.append(r_token_type_ids)
+                    n_attention_mask0.append(r_attention_mask)
+                input_ids[0] = torch.stack(n_input_ids0, dim=1)
+                if token_type_ids[0] is not None:
+                    token_type_ids[0] = torch.stack(n_token_type_ids0, dim=1)
+                else:
+                    token_type_ids[0] = None
+                attention_mask[0] = torch.stack(n_attention_mask0, dim=1)
+
+            if input_ids[1].shape[0] > 0:
+                n_input_ids1 = []
+                if token_type_ids[1] is not None:
+                    n_token_type_ids1 = []
+                n_attention_mask1 = []
+                for idx1 in range(2):
+                    r_input_ids, r_token_type_ids, r_attention_mask = _add_prompt(
+                        self.prompt[idx1], input_ids[1][:, idx1], token_type_ids[1][:, idx1] if token_type_ids[1] is not None else None,
+                        attention_mask[1][:, idx1]
+                    )
+                    n_input_ids1.append(r_input_ids)
+                    if token_type_ids[1] is not None:
+                        n_token_type_ids1.append(r_token_type_ids)
+                    n_attention_mask1.append(r_attention_mask)
+                input_ids[1] = torch.stack(n_input_ids1, dim=1)
+                if token_type_ids[1] is not None:
+                    token_type_ids[1] = torch.stack(n_token_type_ids1, dim=1)
+                else:
+                    token_type_ids[1] = None
+                attention_mask[1] = torch.stack(n_attention_mask1, dim=1)
+            
+            if input_ids[0].shape[-1] != input_ids[1].shape[-1]:
+                if input_ids[0].shape[0] == 0:
+                    input_ids[0] = input_ids[0].reshape(*(input_ids[0].shape[:-1] + input_ids[1].shape[-1:]))
+                    if token_type_ids[0] is not None:
+                        token_type_ids[0] = token_type_ids[0].reshape(*(token_type_ids[0].shape[:-1] + token_type_ids[1].shape[-1:]))
+                    attention_mask[0] = attention_mask[0].reshape(*(attention_mask[0].shape[:-1] + attention_mask[1].shape[-1:]))
+                elif input_ids[1].shape[0] == 0:
+                    input_ids[1] = input_ids[1].reshape(*(input_ids[1].shape[:-1] + input_ids[0].shape[-1:]))
+                    if token_type_ids[1] is not None:
+                        token_type_ids[1] = token_type_ids[1].reshape(*(token_type_ids[1].shape[:-1] + token_type_ids[0].shape[-1:]))
+                    attention_mask[1] = attention_mask[1].reshape(*(attention_mask[1].shape[:-1] + attention_mask[0].shape[-1:]))
+                else:
+                    raise Exception
+
+        else:
+
+            if len(input_ids.shape) == 3:
+                n_input_ids = []
+                if token_type_ids is not None:
+                    n_token_type_ids = []
+                n_attention_mask = []
+
+                for idx1 in range(input_ids.shape[1]):
+                    r_input_ids, r_token_type_ids, r_attention_mask = _add_prompt(
+                        self.prompt[idx1 % 2], input_ids[:, idx1], token_type_ids[:, idx1] if token_type_ids is not None else None, 
+                        attention_mask[:, idx1]
+                    )
+                    n_input_ids.append(r_input_ids)
+                    if token_type_ids is not None:
+                        n_token_type_ids.append(r_token_type_ids)
+                    n_attention_mask.append(r_attention_mask)
+                input_ids = torch.stack(n_input_ids, dim=1)
+                if token_type_ids is not None:
+                    token_type_ids = torch.stack(n_token_type_ids, dim=1)
+                attention_mask = torch.stack(n_attention_mask, dim=1)
+
+            else:
+                input_ids, token_type_ids, attention_mask = _add_prompt(
+                    self.prompt[0], input_ids, token_type_ids, attention_mask
+                )
+
+        return input_ids, token_type_ids, attention_mask
+
     def _hyper_forward(self, encoder, 
         input_ids=None,
         attention_mask=None,
@@ -223,6 +347,11 @@ class InitAndForward:
     ) -> SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         ori_input_ids = input_ids
+
+        # # FIXME
+        # input_ids[0] = input_ids[0][:, :3]
+        # attention_mask[0] = attention_mask[0][:, :3]
+        # token_type_ids[0] = token_type_ids[0][:, :3]
 
         if self.hierarchy_type.count("aigen"):
             aigen_batch_size = input_ids[0].size(0)
@@ -507,41 +636,15 @@ class InitAndForward:
         
         elif self.hierarchy_type.count("aigen"):
             
-            if input_ids[0].shape[0] > 0: # FIXME: for large aigen
-                acc_flag = False
-                if self.aigen_input_ids is None:
-                    self.aigen_input_ids = input_ids[0]
-                    self.aigen_attention_mask = attention_mask[0]
-                    self.aigen_token_type_ids = token_type_ids[0]
-                    acc_flag = True
-                else:
-                    if input_ids[0].shape[-1] == self.aigen_input_ids.shape[-1]:
-                        self.aigen_input_ids = torch.cat([self.aigen_input_ids, input_ids[0]], dim=0)
-                        self.aigen_attention_mask = torch.cat([self.aigen_attention_mask, attention_mask[0]])
-                        self.aigen_token_type_ids = torch.cat([self.aigen_token_type_ids, token_type_ids[0]])
-                        acc_flag = True
-                if acc_flag:
-                    if self.aigen_input_ids.shape[0] >= 64: # 32
-                        input_ids[0] = self.aigen_input_ids
-                        attention_mask[0] = self.aigen_attention_mask
-                        token_type_ids[0] = self.aigen_token_type_ids
-                        self.aigen_input_ids = None
-                        self.aigen_attention_mask = None
-                        self.aigen_token_type_ids = None
-                    else:
-                        input_ids[0] = input_ids[0][:0]
-                        attention_mask[0] = attention_mask[0][:0]
-                        token_type_ids[0] = token_type_ids[0][:0]
-                aigen_batch_size = input_ids[0].size(0)
-                aigen_sent_num = input_ids[0].size(1)
-                other_batch_size = input_ids[1].size(0)
-
             inp_input_ids = torch.cat([input_ids[0].reshape(-1, input_ids[0].shape[-1]), 
                                        input_ids[1].reshape(-1, input_ids[1].shape[-1])], dim=0) # shape of [abs * aigen_sent_num + obs * 2, seq_len]
             inp_attention_mask = torch.cat([attention_mask[0].reshape(-1, attention_mask[0].shape[-1]),
                                             attention_mask[1].reshape(-1, attention_mask[1].shape[-1])], dim=0)
-            inp_token_type_ids = torch.cat([token_type_ids[0].reshape(-1, token_type_ids[0].shape[-1]),
-                                            token_type_ids[1].reshape(-1, token_type_ids[1].shape[-1])], dim=0)
+            if token_type_ids is not None and token_type_ids[1] is not None:
+                inp_token_type_ids = torch.cat([token_type_ids[0].reshape(-1, token_type_ids[0].shape[-1]),
+                                                token_type_ids[1].reshape(-1, token_type_ids[1].shape[-1])], dim=0)
+            else:
+                inp_token_type_ids = None
 
             # Get raw embeddings
             outputs = encoder(
@@ -556,89 +659,134 @@ class InitAndForward:
                 return_dict=True,
             )
 
-            hyperbolic_embedding = self._get_hyperbolic_embedding(inp_attention_mask, outputs) # (abs * aigen_sent_num + obs * 2, hidden_size)
+            hyperbolic_embedding = self._get_hyperbolic_embedding(inp_attention_mask, outputs, with_mlp=True) # (abs * aigen_sent_num + obs * 2, hidden_size)
 
             if dist.is_initialized() and self.training:
                 raise NotImplementedError # FIXME unavailable when abs and obs are not fixed between batches.
 
             aigen_h_embedding = hyperbolic_embedding[:aigen_batch_size * aigen_sent_num].reshape(aigen_batch_size, aigen_sent_num, hyperbolic_embedding.shape[-1])
             other_h_embedding = hyperbolic_embedding[aigen_batch_size * aigen_sent_num:].reshape(other_batch_size, 2, hyperbolic_embedding.shape[-1])
-            temp1, temp2, temp3 = self.temp, 5e-2, 5e-3 # FIXME: decide temp
+            temp1, temp2, temp3 = self.temp, 5e-2, [[5e-3, 15e-2], [2e-1]] # FIXME: decide temp
+            use_loss4 = False
+            use_native_loss = False
 
-            if other_batch_size > 0:
-                # loss1: CrossEntropy or InforNCE
+            if use_native_loss:
+
+                loss2, loss3, loss4 = None, None, None
                 loss1_fn = nn.CrossEntropyLoss()
-                embeds_0 = other_h_embedding[:, :1] # (obs, 1, hidden_size)
-                embeds_1 = torch.cat([other_h_embedding[:, 1], 
-                                    #   aigen_h_embedding.reshape(aigen_batch_size * aigen_sent_num, 
-                                      aigen_h_embedding[:, :1].reshape(aigen_batch_size * 1, # FIXME 
-                                      hyperbolic_embedding.shape[-1])], dim=0).unsqueeze(0) # (1, obs + abs * asn, hidden_size)
-                # embeds_1 = other_h_embedding[None, :, 1] # FIXME
-                hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (obs, obs + abs * asn)
+                embeds_0 = torch.cat([other_h_embedding[:, :1], aigen_h_embedding[:, :1]], dim=0)
+                # wo_hn
+                # embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, 1]], dim=1)
+                # w_hn
+                embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, 1], aigen_h_embedding[None, :, -1]], dim=1)
+                hyperbolic_similarity = self.similarity(embeds_0, embeds_1)
                 labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
                 loss1 = loss1_fn(hyperbolic_similarity / temp1, labels)
+
             else:
-                loss1 = None
-            
-            
-            if aigen_batch_size > 0:
-                # loss2: CrossEntropy or InforNCE
-                loss2_fn = nn.CrossEntropyLoss()
-                loss2 = torch.tensor(0., device=self.device)
-                aigen_pos_sent_num = 1 # FIXME
-                embeds_0 = aigen_h_embedding[:, :1] # (abs, 1, hidden_size)
-                for aigen_pos_idx in range(1, aigen_pos_sent_num + 1):
-                    # TODO: 是否要增加其他 aigen 的所有句子作为负例？
-                    # 无 aigen 负例
-                    embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
-                    # embeds_1 = torch.cat([aigen_h_embedding[:, 2], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # FIXME
-                    # aigen 得分最低的作为负例
-                    # embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, 2 * abs + obs, hidden_size)
+
+                if other_batch_size > 0:
+                    # loss1: CrossEntropy or InforNCE
+                    loss1_fn = nn.CrossEntropyLoss()
+                    embeds_0 = other_h_embedding[:, :1] # (obs, 1, hidden_size)
+                    embeds_1 = torch.cat([other_h_embedding[:, 1], 
+                                        #   aigen_h_embedding.reshape(aigen_batch_size * aigen_sent_num, 
+                                        aigen_h_embedding[:, :1].reshape(aigen_batch_size * 1, # FIXME 
+                                        hyperbolic_embedding.shape[-1])], dim=0).unsqueeze(0) # (1, obs + abs * asn, hidden_size)
+                    # embeds_1 = other_h_embedding[None, :, 1] # FIXME
+                    hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (obs, obs + abs * asn)
+                    labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                    loss1 = loss1_fn(hyperbolic_similarity / temp1, labels)
+                else:
+                    loss1 = None
+                
+                
+                if aigen_batch_size > 0:
+                    # loss2: CrossEntropy or InforNCE
+                    loss2_fn = nn.CrossEntropyLoss()
+                    loss2 = torch.tensor(0., device=self.device)
+                    aigen_pos_sent_num = 1 # FIXME
+                    embeds_0 = aigen_h_embedding[:, :1] # (abs, 1, hidden_size)
+                    '''
+                    for aigen_pos_idx in range(1, aigen_pos_sent_num + 1):
+                        # TODO: 是否要增加其他 aigen 的所有句子作为负例？
+                        # 无 aigen 负例
+                        embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
+                        # embeds_1 = torch.cat([aigen_h_embedding[:, 2], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # FIXME
+                        # aigen 得分最低的作为负例
+                        # embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, 2 * abs + obs, hidden_size)
+                        hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (abs, obs + abs)
+                        labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                        loss2 += loss2_fn(hyperbolic_similarity / temp2, labels)
+                    loss2 /= aigen_pos_sent_num
+                    '''
+                    embeds_1 = torch.cat([aigen_h_embedding[:, 1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
+                    # embeds_1 = torch.cat([aigen_h_embedding[:, 1], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
                     hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (abs, obs + abs)
                     labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
                     loss2 += loss2_fn(hyperbolic_similarity / temp2, labels)
-                loss2 /= aigen_pos_sent_num
 
-                # loss3
-                levels_sim = []
-                embeds_0 = aigen_h_embedding[:, 0]
-                for level in range(1, aigen_sent_num):
-                    embeds_1 = aigen_h_embedding[:, level]
-                    levels_sim.append(self.similarity(embeds_0, embeds_1))
-                levels_sim = torch.stack(levels_sim, dim=-1)
+                    # loss3
+                    levels_sim = []
+                    embeds_0 = aigen_h_embedding[:, 0]
+                    for level in range(1, aigen_sent_num):
+                        embeds_1 = aigen_h_embedding[:, level]
+                        levels_sim.append(self.similarity(embeds_0, embeds_1))
+                    levels_sim = torch.stack(levels_sim, dim=-1)
 
-                # option0: KL divergence, for KLD, input should be log_p, and target should be p, and reduction should be 'batchmean'
-                # consider cross_entropy, input should be logits, target should be p
-                # loss3_fn = nn.KLDivLoss(reduction='batchmean')
-                # target = torch.softmax(torch.tensor([[5, 4, 3, 2, 1, 0.5][:aigen_sent_num - 1]]).to(dtype=torch.float, device=self.device), dim=-1)
-                # loss3 = loss3_fn(torch.log_softmax(levels_sim / temp3, dim=-1), target.expand_as(levels_sim))
+                    # option0: KL divergence, for KLD, input should be log_p, and target should be p, and reduction should be 'batchmean'
+                    # consider cross_entropy, input should be logits, target should be p
+                    # loss3_fn = nn.KLDivLoss(reduction='batchmean')
+                    # target = torch.softmax(torch.tensor([[5, 4, 3, 2, 1, 0.5][:aigen_sent_num - 1]]).to(dtype=torch.float, device=self.device), dim=-1)
+                    # loss3 = loss3_fn(torch.log_softmax(levels_sim / temp3, dim=-1), target.expand_as(levels_sim))
 
-                # option1: pair_wise
-                # loss3_fn = F.logsigmoid # logsigmoid
-                loss3_fn = F.relu # triplet
-                loss3 = torch.tensor(0., device=self.device)
-                # simple
-                if aigen_sent_num - 2:
-                    for idx in range(aigen_sent_num - 2):
-                        # loss3 -= loss3_fn((levels_sim[:, idx] - levels_sim[:, idx + 1]) / temp3).mean() # logsigmoid
-                        loss3 += loss3_fn(levels_sim[:, idx + 1] - levels_sim[:, idx] + temp3).mean() # triplet
-                    loss3 /= (aigen_sent_num - 2)
-                # # complex
-                # for idx_0 in range(aigen_sent_num - 2):
-                #     for idx_1 in range(idx_0 +1, aigen_sent_num - 1):
-                #         loss3 -= loss3_fn((levels_sim[:, idx_0] - levels_sim[:, idx_1]) / temp3).mean()
-                # loss3 /= ((aigen_sent_num - 1) * (aigen_sent_num - 2) // 2)
+                    # option1: pair_wise
+                    # loss3_fn = F.logsigmoid # logsigmoid
+                    loss3_fn = F.relu # triplet
+                    loss3 = torch.tensor(0., device=self.device)
+                    # simple
+                    if aigen_sent_num - 2:
+                        start = 0
+                        for idx in range(start, aigen_sent_num - 2):
+                            # loss3 -= loss3_fn((levels_sim[:, idx] - levels_sim[:, idx + 1]) / temp3).mean() # logsigmoid
+                            loss3 += loss3_fn(levels_sim[:, idx + 1] - levels_sim[:, idx] + 
+                                            temp3[0][idx if idx < len(temp3[0]) else len(temp3[0]) - 1]).mean()
+                                #    + loss3_fn(levels_sim[:, idx] - levels_sim[:, idx + 1] - 
+                                #               temp3[1][idx if idx < len(temp3[1]) else len(temp3[1]) - 1]).mean() # triplet
+                        loss3 /= (aigen_sent_num - 2) - start
+                    # # complex
+                    # for idx_0 in range(aigen_sent_num - 2):
+                    #     for idx_1 in range(idx_0 +1, aigen_sent_num - 1):
+                    #         loss3 -= loss3_fn((levels_sim[:, idx_0] - levels_sim[:, idx_1]) / temp3).mean()
+                    # loss3 /= ((aigen_sent_num - 1) * (aigen_sent_num - 2) // 2)
 
-            else:
-                loss2 = None
-                loss3 = None
+                else:
+                    loss2 = None
+                    loss3 = None
+
+                if use_loss4:
+                    loss4 = torch.tensor(0., device=self.device)
+                    for k in self.named_parameters_cache:
+                        if self.named_parameters_cache[k].device == self.device:
+                            break
+                        self.named_parameters_cache[k] = self.named_parameters_cache[k].to(self.device)
+                    for k, v in self.named_parameters():
+                        if k in self.named_parameters_cache:
+                            loss4 += torch.pow(v - self.named_parameters_cache[k], 2).sum()
+                    loss4 /= 2
+                else:
+                    loss4 = None
 
             loss = torch.tensor(0.).to(self.device)
             levels_hyperbolic_similarity = None
             levels_outputs = outputs    # for return
+            if loss4 is not None:
+                gamma = 2e-9
+                self.loss_logs['loss4'].append(loss4.item())
+                loss += gamma * loss4
             if loss2 is not None:
                 beta2 = 0.4 # 0.2 # FIXME
-                beta3 = 0. # 0.6 # FIXME
+                beta3 = 1. # 0.6 # FIXME
                 self.loss_logs['loss2'].append(loss2.item())
                 self.loss_logs['loss3'].append(loss3.item())
                 loss += beta2 * loss2 + beta3 * loss3
@@ -767,6 +915,9 @@ class InitAndForward:
         nn.init.normal_(self.mlp.linear.weight, 0, 6e-3)
         nn.init.normal_(self.mlp.linear.bias, 0, 6e-3)
 
+        self.named_parameters_cache = {k: v.detach().clone() for k, v in self.named_parameters() 
+                                       if ('bert' in k or 'roberta' in k) and v.requires_grad == True}
+
     def forward(self,
             input_ids=None,
             attention_mask=None,
@@ -781,8 +932,11 @@ class InitAndForward:
             return_dict=None,
             sent_emb=False
     ) -> Union[Tuple, Dict[str, Any]]:
+        if self.pooler_type == 'mask':
+            input_ids, token_type_ids, attention_mask = self.add_prompt(input_ids, token_type_ids, attention_mask)
+
         forward_fn = self._sentemb_forward if sent_emb else self._hyper_forward
-        
+
         return forward_fn(self.bert if hasattr(self, 'bert') else self.roberta, 
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -832,6 +986,19 @@ class BertForHyper(InitAndForward, BertPreTrainedModel):
         # self.model_args = model_kwargs["model_args"]
         self.bert = BertModel(config, add_pooling_layer=False)
 
+        self.prompt = [
+            {
+                'input_ids': [torch.tensor([2023, 6251, 1024, 1000]), torch.tensor([1000, 2965, 103])],
+                'token_type_ids': [torch.tensor([0, 0, 0, 0]), torch.tensor([0, 0, 0])],
+                'attention_mask': [torch.tensor([1, 1, 1, 1]), torch.tensor([1, 1, 1])]
+            },
+            {
+                'input_ids': [torch.tensor([2023, 6251, 1997, 1000]), torch.tensor([1000, 2965, 103])],
+                'token_type_ids': [torch.tensor([0, 0, 0, 0]), torch.tensor([0, 0, 0])],
+                'attention_mask': [torch.tensor([1, 1, 1, 1]), torch.tensor([1, 1, 1])]
+            }
+        ]
+
         super()._hyper_init(config, hierarchy_type=hierarchy_type, dropout_change_layers=dropout_change_layers)
 
 class RobertaForHyper(InitAndForward, RobertaPreTrainedModel):
@@ -843,5 +1010,16 @@ class RobertaForHyper(InitAndForward, RobertaPreTrainedModel):
         super().__init__(config, hierarchy_type=hierarchy_type)
         # self.model_args = model_kwargs["model_args"]
         self.roberta = RobertaModel(config, add_pooling_layer=False)
+
+        self.prompt = [
+            {
+                'input_ids': [torch.tensor([713, 3645, 4832, 22]), torch.tensor([113, 839, 50264])],
+                'attention_mask': [torch.tensor([1, 1, 1, 1]), torch.tensor([1, 1, 1])]
+            },
+            {
+                'input_ids': [torch.tensor([713, 3645, 9, 22]), torch.tensor([113, 839, 50264])],
+                'attention_mask': [torch.tensor([1, 1, 1, 1]), torch.tensor([1, 1, 1])]
+            }
+        ]
 
         super()._hyper_init(config, hierarchy_type=hierarchy_type, dropout_change_layers=dropout_change_layers)
