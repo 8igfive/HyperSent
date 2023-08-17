@@ -7,7 +7,7 @@ python train.py \
     --train_file data/230802/nli20k_aigen_sts_3.json \
     --max_seq_length 32 \
     --evaluation_strategy steps \
-    --metric_for_best_model sickr_spearman \
+    --metric_for_best_model stsb_spearman \
     --load_best_model_at_end \
     --eval_steps 125 \
     --learning_rate 1e-5 \

@@ -4,7 +4,7 @@ mkdir -p results/runs
 
 python train.py \
     --model_name_or_path /home/LAB/limx/download/model/bert-base-uncased \
-    --train_file data/230730/wiki1m_token_cutoff_0.10_train.jsonl \
+    --train_file data/230718/wiki1m_aigen_remove_negative_20k_3_train.jsonl \
     --max_seq_length 32 \
     --evaluation_strategy steps \
     --metric_for_best_model stsb_spearman \
@@ -19,7 +19,7 @@ python train.py \
     --pooler_type cls \
     --hyperbolic_size 768 \
     --model_type bert \
-    --output_dir results/runs/test_token_cutoff \
+    --output_dir results/runs/aigens/test_sts/test_wiki_sts_infonce \
     --hierarchy_type aigen \
     --disable_hyper \
     --hierarchy_levels 3\

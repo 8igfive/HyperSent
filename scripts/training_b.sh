@@ -4,10 +4,10 @@ mkdir -p results/runs
 
 python train.py \
     --model_name_or_path /home/LAB/limx/download/model/bert-base-uncased \
-    --train_file data/230802/nli20k_aigen_sts_3.json \
+    --train_file data/230718/wiki1m_aigen_remove_negative_20k_3.json \
     --max_seq_length 32 \
     --evaluation_strategy steps \
-    --metric_for_best_model sickr_spearman \
+    --metric_for_best_model stsb_spearman \
     --load_best_model_at_end \
     --eval_steps 125 \
     --learning_rate 1e-5 \

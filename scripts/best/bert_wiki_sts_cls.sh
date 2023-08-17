@@ -4,14 +4,13 @@ mkdir -p results/runs
 
 python train.py \
     --model_name_or_path /home/LAB/limx/download/model/bert-base-uncased \
-    --train_file data/230730/wiki1m_token_cutoff_0.10_train.jsonl \
+    --train_file data/230728/wiki1m_aigen_remove_negative_20k_3.json \
     --max_seq_length 32 \
     --evaluation_strategy steps \
     --metric_for_best_model stsb_spearman \
     --load_best_model_at_end \
-    --save_steps 125 \
-    --logging_steps 125 \
-    --learning_rate 3e-5 \
+    --eval_steps 125 \
+    --learning_rate 5e-5 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 256 \
     --temp 0.05 \
@@ -19,7 +18,7 @@ python train.py \
     --pooler_type cls \
     --hyperbolic_size 768 \
     --model_type bert \
-    --output_dir results/runs/test_token_cutoff \
+    --output_dir results/runs/best/bert_wiki_sts_cls_bs256lr5e-5m15e-3seed3 \
     --hierarchy_type aigen \
     --disable_hyper \
     --hierarchy_levels 3\
@@ -27,3 +26,4 @@ python train.py \
     --overwrite_output_dir \
     --do_train \
     --do_eval \
+    --seed 3 \

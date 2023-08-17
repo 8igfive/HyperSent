@@ -4,7 +4,7 @@ mkdir -p results/runs
 
 python train.py \
     --model_name_or_path /home/LAB/limx/download/model/bert-base-uncased \
-    --train_file data/230730/wiki1m_token_shuffle_train.jsonl \
+    --train_file data/230730/wiki1m_token_shuffle_train_new.jsonl \
     --max_seq_length 32 \
     --evaluation_strategy steps \
     --metric_for_best_model stsb_spearman \

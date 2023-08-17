@@ -212,14 +212,15 @@ def main():
         prepare_features,
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
-        remove_columns=column_names,
+        remove_columns=[column_name for column_name in column_names if column_name != 'split'],
         load_from_cache_file=not data_args.overwrite_cache,
     )
     
     data_collator = default_data_collator if data_args.pad_to_max_length \
         else OurDataCollatorWithPadding(tokenizer, aigen=('aigen' in training_args.hierarchy_type), 
                                         aigen_sent_num=len(prepare_features.aigen_keys), 
-                                        aigen_batch_size=64, combine_training=True)
+                                        other_sent_num=max(2, len(prepare_features.other_keys)),
+                                        aigen_batch_size=48, combine_training=True)
 
     trainer = HyperTrainer(
         model=model,

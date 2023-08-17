@@ -486,6 +486,11 @@ class OurTrainingArguments(TrainingArguments):
         metadata={"help": "Evaluate transfer task dev sets (in validation)."}
     )
 
+    # overload
+    remove_unused_columns: Optional[bool] = field(
+        default=False, metadata={"help": "Remove columns not required by the model when using an nlp.Dataset."}
+    )
+
 # Prepare features
 @dataclass
 class PrepareFeatures:
@@ -577,9 +582,11 @@ class PrepareFeatures:
             sentences = []
             if not hasattr(self, 'aigen_keys'): # check which key to use
                 self.aigen_keys = []
+            if not hasattr(self, 'other_keys'):
+                self.other_keys = []
 
             for idx in range(total):
-                if examples['split'][idx] == 'aigen': # FIXME: change to aigen
+                if examples['split'][idx] == 'aigen':
                     if len(self.aigen_keys) == 0: # check which key to use
                         for key in ['sentence', '5', '4', '3', '2', '1', '0']:
                             if examples[key][idx] != '':
@@ -587,10 +594,20 @@ class PrepareFeatures:
                     for key in self.aigen_keys:
                         sentences.append(examples[key][idx] if examples[key][idx] is not None else ' ')
             assert len(sentences) == 0 or len(sentences) % len(self.aigen_keys) == 0
-            gen_group_num = (0 if len(sentences) == 0 else len(sentences) // len(self.aigen_keys))
+            aigen_group_num = (0 if len(sentences) == 0 else len(sentences) // len(self.aigen_keys))
+            
             for idx in range(total):
                 if examples['split'][idx] == 'other':
-                    sentences.append(examples['sentence'][idx] if examples['sentence'][idx] is not None else ' ')
+                    if len(self.other_keys) == 0:
+                        for key in ['sentence', '5', '4', '3', '2', '1', '0']:
+                            if examples[key][idx] != '':
+                                self.other_keys.append(key)
+                    for key in self.other_keys:
+                        sentences.append(examples[key][idx] if examples[key][idx] is not None else ' ')
+            assert len(sentences) - aigen_group_num * len(self.aigen_keys) == 0 or \
+             (len(sentences) - aigen_group_num * len(self.aigen_keys)) % len(self.other_keys) == 0
+            other_group_num = 0 if len(sentences) - aigen_group_num * len(self.aigen_keys) == 0 else\
+             (len(sentences) - aigen_group_num * len(self.aigen_keys)) // len(self.other_keys)
 
             sent_features = self.tokenizer(
                 sentences,
@@ -600,12 +617,25 @@ class PrepareFeatures:
             )
 
             features = {key: [] for key in sent_features.keys()}
-            for idx in range(gen_group_num):
+            features['split'] = []
+            for idx in range(aigen_group_num):
                 for key in features.keys():
-                    features[key].append(sent_features[key][idx * len(self.aigen_keys): (idx + 1) * len(self.aigen_keys)])
-            for idx in range(gen_group_num * len(self.aigen_keys), len(sentences)):
+                    if key == 'split':
+                        features[key].append('aigen')
+                    else:
+                        features[key].append(sent_features[key][idx * len(self.aigen_keys): (idx + 1) * len(self.aigen_keys)])
+            for idx in range(other_group_num):
                 for key in features.keys():
-                    features[key].append([sent_features[key][idx]] * 2)
+                    if key == 'split':
+                        features[key].append('other')
+                    else:
+                        features[key].append(sent_features[key][
+                            aigen_group_num * len(self.aigen_keys) + idx * len(self.other_keys): 
+                            aigen_group_num * len(self.aigen_keys) + (idx + 1) * len(self.other_keys)
+                        ])
+                        if len(self.other_keys) == 1:
+                            features[key][-1] = features[key][-1] * 2
+
         else:
             raise NotImplementedError
         
@@ -653,6 +683,7 @@ class OurDataCollatorWithPadding:
     # mlm: bool = True
     # mlm_probability: float = data_args.mlm_probability
     aigen_sent_num: int = 0
+    other_sent_num: int = 0
     aigen_batch_size: int = 64
     combine_training: bool = False
     aigen_features_cache = []
@@ -660,13 +691,12 @@ class OurDataCollatorWithPadding:
 
     def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
-        drop_keys = ['loss_pair']
+        drop_keys = ['loss_pair', 'split']
 
         if self.aigen:
-            
             batch_size = len(features)
             for feature in features:
-                if len(feature['input_ids']) == self.aigen_sent_num:
+                if feature['split'] == 'aigen':
                     self.aigen_features_cache.append(feature)
                 else:
                     self.other_features_cache.append(feature)
@@ -699,16 +729,18 @@ class OurDataCollatorWithPadding:
                 self.other_features_cache = []
 
             flat_features = []
-            gen_num = 0
+            aigen_num = 0
+            other_num = 0
             for feature in features:
-                if len(feature['input_ids']) == self.aigen_sent_num: # aigen: among (sentence, 5, 4, 3, 2, 1, 0)
-                    gen_num += 1
+                if feature['split'] == 'aigen':
+                    aigen_num += 1
                     for i in range(self.aigen_sent_num):
                         flat_features.append({k: (v[i] if k in special_keys else v) 
                                              for k, v in feature.items() if k not in drop_keys})
             for feature in features:                             
-                if len(feature['input_ids']) == 2: # other
-                    for i in range(2):
+                if feature['split'] == 'other':
+                    other_num += 1
+                    for i in range(self.other_sent_num):
                         flat_features.append({k: (v[i] if k in special_keys else v) 
                                              for k, v in feature.items() if k not in drop_keys})
             
@@ -720,8 +752,8 @@ class OurDataCollatorWithPadding:
                 return_tensors="pt",
             )
             # input_ids, attention_mask, token_type_ids：[Tensor of shape(abs, 7, seq_len), Tensor of shape(obs, 2, seq_len)]
-            batch = {k : [v[: gen_num * self.aigen_sent_num], v[gen_num * self.aigen_sent_num: ]] for k, v in batch.items()}
-            for i, sen_num in zip(range(2), [self.aigen_sent_num, 2]):
+            batch = {k : [v[: aigen_num * self.aigen_sent_num], v[aigen_num * self.aigen_sent_num: ]] for k, v in batch.items()}
+            for i, sen_num in zip(range(2), [self.aigen_sent_num, self.other_sent_num]):
                 for k, v in batch.items():
                     if k in special_keys:
                         v[i] = v[i].reshape((v[i].shape[0] // sen_num if sen_num else 0), sen_num, v[i].shape[1])

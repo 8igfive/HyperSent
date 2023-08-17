@@ -185,8 +185,13 @@ class InitAndForward:
                 return self.mlp(cls_embedding) #(bs, hidden_len)
             else:
                 return cls_embedding
-        elif 'avg' in self.pooler_type: 
-            return self._avg_embedding(attention_mask, outputs, with_mlp=with_mlp)
+        elif 'avg' in self.pooler_type:
+            return ((last_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1))
+
+            # if self.disable_hyper:
+            #     return ((last_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1))
+            # else:
+            #     return self._avg_embedding(attention_mask, outputs, with_mlp=with_mlp)
             # return self._avg_embedding_deprecated(attention_mask, outputs)
         elif 'mask' in self.pooler_type:
             mask_embedding = []
@@ -273,11 +278,17 @@ class InitAndForward:
                 if token_type_ids[1] is not None:
                     n_token_type_ids1 = []
                 n_attention_mask1 = []
-                for idx1 in range(2):
-                    r_input_ids, r_token_type_ids, r_attention_mask = _add_prompt(
-                        self.prompt[idx1], input_ids[1][:, idx1], token_type_ids[1][:, idx1] if token_type_ids[1] is not None else None,
-                        attention_mask[1][:, idx1]
-                    )
+                for idx1 in range(input_ids[1].shape[1]):
+                    if input_ids[1].shape[1] == 2:
+                        r_input_ids, r_token_type_ids, r_attention_mask = _add_prompt(
+                            self.prompt[idx1], input_ids[1][:, idx1], token_type_ids[1][:, idx1] if token_type_ids[1] is not None else None,
+                            attention_mask[1][:, idx1]
+                        )
+                    else:
+                        r_input_ids, r_token_type_ids, r_attention_mask = _add_prompt(
+                            self.prompt[0], input_ids[1][:, idx1], token_type_ids[1][:, idx1] if token_type_ids[1] is not None else None,
+                            attention_mask[1][:, idx1]
+                        )
                     n_input_ids1.append(r_input_ids)
                     if token_type_ids[1] is not None:
                         n_token_type_ids1.append(r_token_type_ids)
@@ -357,6 +368,8 @@ class InitAndForward:
             aigen_batch_size = input_ids[0].size(0)
             aigen_sent_num = input_ids[0].size(1)
             other_batch_size = input_ids[1].size(0)
+            other_sent_num = input_ids[1].size(1)
+
         else:
             batch_size = input_ids.size(0)
             num_sent = input_ids.size(1) # level num
@@ -665,23 +678,66 @@ class InitAndForward:
                 raise NotImplementedError # FIXME unavailable when abs and obs are not fixed between batches.
 
             aigen_h_embedding = hyperbolic_embedding[:aigen_batch_size * aigen_sent_num].reshape(aigen_batch_size, aigen_sent_num, hyperbolic_embedding.shape[-1])
-            other_h_embedding = hyperbolic_embedding[aigen_batch_size * aigen_sent_num:].reshape(other_batch_size, 2, hyperbolic_embedding.shape[-1])
-            temp1, temp2, temp3 = self.temp, 5e-2, [[5e-3, 15e-2], [2e-1]] # FIXME: decide temp
+            other_h_embedding = hyperbolic_embedding[aigen_batch_size * aigen_sent_num:].reshape(other_batch_size, other_sent_num, hyperbolic_embedding.shape[-1])
+            temp1, temp2, temp3 = self.temp, 5e-2, [[5e-3, 4e-2], [2e-1]] # FIXME: decide temp
             use_loss4 = False
-            use_native_loss = False
+            use_native_loss = True
 
             if use_native_loss:
+                use_loss3 = True
 
-                loss2, loss3, loss4 = None, None, None
+                loss2, loss4 = None, None
                 loss1_fn = nn.CrossEntropyLoss()
                 embeds_0 = torch.cat([other_h_embedding[:, :1], aigen_h_embedding[:, :1]], dim=0)
+                # embeds_0 = aigen_h_embedding[:, :1] # FIXME
+            
                 # wo_hn
                 # embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, 1]], dim=1)
                 # w_hn
-                embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, 1], aigen_h_embedding[None, :, -1]], dim=1)
+                # embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, 1], aigen_h_embedding[None, :, -1]], dim=1)                
+                # cutoff&shuffle (only for cutoff0.1, shuffle use the above)
+                # embeds_1 = aigen_h_embedding[None, :, 1]
+                # embeds_1 = aigen_h_embedding[None, :, 0] # FIXME
+                # embeds_1 = embeds_1.expand(aigen_batch_size, *embeds_1.shape[1:])
+                # embeds_1 = torch.diagonal_scatter(embeds_1, aigen_h_embedding[:, 1].T)
+                
+                # new for aigen
+                aigen_pos_idx = 2 if aigen_sent_num > 3 else 1
+                embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, aigen_pos_idx]], dim=1)                
+                # embeds_1 = torch.cat([other_h_embedding[None, :, 1], aigen_h_embedding[None, :, aigen_pos_idx], aigen_h_embedding[None, :, -1]], dim=1)
+                
+                # embeds_1 = torch.cat([other_h_embedding[None, :, 0], aigen_h_embedding[None, :, 0]], dim=1)
+                # embeds_1 = embeds_1.expand(embeds_0.shape[0], *embeds_1.shape[1:])
+                # embeds_1 = torch.diagonal_scatter(embeds_1, 
+                #            torch.cat([other_h_embedding[:, 1], aigen_h_embedding[:, 1]], dim=0).T)
+                
                 hyperbolic_similarity = self.similarity(embeds_0, embeds_1)
                 labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
                 loss1 = loss1_fn(hyperbolic_similarity / temp1, labels)
+
+                if use_loss3 and aigen_batch_size > 0:
+                    # loss3
+                    levels_sim = []
+                    embeds_0 = aigen_h_embedding[:, 0]
+                    for level in range(1, aigen_sent_num):
+                        embeds_1 = aigen_h_embedding[:, level]
+                        levels_sim.append(self.similarity(embeds_0, embeds_1))
+                    levels_sim = torch.stack(levels_sim, dim=-1)
+
+                    loss3_fn = F.relu # triplet
+                    loss3 = torch.tensor(0., device=self.device)
+                    # simple
+                    if aigen_sent_num - 2:
+                        start = 0
+                        for idx in range(start, aigen_sent_num - 2):
+                            # loss3 -= loss3_fn((levels_sim[:, idx] - levels_sim[:, idx + 1]) / temp3).mean() # logsigmoid
+                            loss3 += loss3_fn(levels_sim[:, idx + 1] - levels_sim[:, idx] + 
+                                            temp3[0][idx if idx < len(temp3[0]) else len(temp3[0]) - 1]).mean()
+                                #    + loss3_fn(levels_sim[:, idx] - levels_sim[:, idx + 1] - 
+                                #               temp3[1][idx if idx < len(temp3[1]) else len(temp3[1]) - 1]).mean() # triplet
+                        loss3 /= (aigen_sent_num - 2) - start
+                else:
+                    loss3 = None
 
             else:
 
@@ -691,8 +747,10 @@ class InitAndForward:
                     embeds_0 = other_h_embedding[:, :1] # (obs, 1, hidden_size)
                     embeds_1 = torch.cat([other_h_embedding[:, 1], 
                                         #   aigen_h_embedding.reshape(aigen_batch_size * aigen_sent_num, 
-                                        aigen_h_embedding[:, :1].reshape(aigen_batch_size * 1, # FIXME 
-                                        hyperbolic_embedding.shape[-1])], dim=0).unsqueeze(0) # (1, obs + abs * asn, hidden_size)
+                                        aigen_h_embedding[:, 1:2].reshape(aigen_batch_size * 1, # FIXME: original: aigen_h_embedding[:, :1]
+                                        hyperbolic_embedding.shape[-1])] + 
+                                        ([] if other_sent_num == 2 else [other_h_embedding[:, -1]])
+                                        , dim=0).unsqueeze(0) # (1, obs + abs * asn, hidden_size)
                     # embeds_1 = other_h_embedding[None, :, 1] # FIXME
                     hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (obs, obs + abs * asn)
                     labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
@@ -705,26 +763,29 @@ class InitAndForward:
                     # loss2: CrossEntropy or InforNCE
                     loss2_fn = nn.CrossEntropyLoss()
                     loss2 = torch.tensor(0., device=self.device)
-                    aigen_pos_sent_num = 1 # FIXME
+                    aigen_pos_sent_num = 2 # FIXME
                     embeds_0 = aigen_h_embedding[:, :1] # (abs, 1, hidden_size)
-                    '''
+                    
                     for aigen_pos_idx in range(1, aigen_pos_sent_num + 1):
-                        # TODO: 是否要增加其他 aigen 的所有句子作为负例？
+                        if aigen_pos_idx == aigen_pos_sent_num:
+                            embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0)
+                        else:
+                            embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
                         # 无 aigen 负例
-                        embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
-                        # embeds_1 = torch.cat([aigen_h_embedding[:, 2], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # FIXME
+                        # embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
                         # aigen 得分最低的作为负例
                         # embeds_1 = torch.cat([aigen_h_embedding[:, aigen_pos_idx], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, 2 * abs + obs, hidden_size)
+                        
                         hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (abs, obs + abs)
                         labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
                         loss2 += loss2_fn(hyperbolic_similarity / temp2, labels)
                     loss2 /= aigen_pos_sent_num
-                    '''
-                    embeds_1 = torch.cat([aigen_h_embedding[:, 1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
-                    # embeds_1 = torch.cat([aigen_h_embedding[:, 1], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
-                    hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (abs, obs + abs)
-                    labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
-                    loss2 += loss2_fn(hyperbolic_similarity / temp2, labels)
+                    
+                    # embeds_1 = torch.cat([aigen_h_embedding[:, 1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
+                    # # embeds_1 = torch.cat([aigen_h_embedding[:, 1], aigen_h_embedding[:, -1], other_h_embedding[:, 1]], dim=0).unsqueeze(0) # (1, abs + obs, hidden_size)
+                    # hyperbolic_similarity = self.similarity(embeds_0, embeds_1) # (abs, obs + abs)
+                    # labels = torch.arange(hyperbolic_similarity.shape[0]).to(dtype=torch.long, device=self.device)
+                    # loss2 += loss2_fn(hyperbolic_similarity / temp2, labels)
 
                     # loss3
                     levels_sim = []
@@ -785,14 +846,17 @@ class InitAndForward:
                 self.loss_logs['loss4'].append(loss4.item())
                 loss += gamma * loss4
             if loss2 is not None:
-                beta2 = 0.4 # 0.2 # FIXME
-                beta3 = 1. # 0.6 # FIXME
+                beta2 = (aigen_batch_size) / (aigen_batch_size + other_batch_size) # 0.4 # FIXME
                 self.loss_logs['loss2'].append(loss2.item())
-                self.loss_logs['loss3'].append(loss3.item())
-                loss += beta2 * loss2 + beta3 * loss3
-                levels_hyperbolic_similarity = levels_sim
+                loss += beta2 * loss2
             else:
                 beta2 = 0.
+            if loss3 is not None:
+                beta3 = 1. # 1. # FIXME
+                self.loss_logs['loss3'].append(loss3.item())
+                loss += beta3 * loss3
+                levels_hyperbolic_similarity = levels_sim
+            else:
                 beta3 = 0.
             if loss1 is not None:
                 self.loss_logs['loss1'].append(loss1.item())

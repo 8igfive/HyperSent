@@ -23,7 +23,7 @@ def load_model(model_path: str):
     model = model.train()
     return model, tokenizer, device
 
-def load_wiki(txt_path: str, mode: str = 'positive'):
+def load_wiki(txt_path: str, mode: str = 'positive', whn: bool = True):
     with open(txt_path, 'r', encoding='utf8') as fi:
         lines = [line.strip() for line in fi]
     
@@ -38,7 +38,7 @@ def load_wiki(txt_path: str, mode: str = 'positive'):
     else:
          raise NotImplementedError
 
-def load_nli(csv_path: str, mode: str = 'positive'):
+def load_nli(csv_path: str, mode: str = 'positive', whn: bool = True):
     df = pd.read_csv(csv_path)
     lines = []
     for row in df.iloc:
@@ -47,18 +47,24 @@ def load_nli(csv_path: str, mode: str = 'positive'):
     if mode == 'positive':
         return [(line[0], line[1]) for line in lines]
     elif mode == 'negative':
-        return [(line[0], line[2]) for line in lines]
+        if whn:
+            return [(line[0], line[2]) for line in lines]
+        else:
+            another_lines = lines.copy()
+            random.shuffle(another_lines)
+            return [(line0[0], line1[0]) for line0, line1 in zip(lines, another_lines)]
     elif mode == 'all':
         res = []
         for line in lines:
             res.append(line[0])
             res.append(line[1])
-            res.append(line[2])
+            if whn:
+                res.append(line[2])
         return res
     else:
         raise NotImplementedError
 
-def load_stsb(split: str, mode: str = 'positive'):
+def load_stsb(split: str, mode: str = 'positive', whn: bool = True):
     stsb = load_dataset(r'mteb/stsbenchmark-sts', split=split)
 
     if mode == 'positive':
@@ -74,7 +80,7 @@ def load_stsb(split: str, mode: str = 'positive'):
     else:
         raise NotImplementedError
 
-def load_aigen(path: str, mode: str = 'positive'):
+def load_aigen(path: str, mode: str = 'positive', whn: bool = True, multiple_positive: bool = False):
     with open(path, 'r', encoding='utf8') as fi:
         rows = [json.loads(row) for row in fi]
         aigens = [tuple(row[key] for key in ['sentence', '5', '4', '3', '2', '1', '0'] if row[key] != '') 
@@ -82,25 +88,44 @@ def load_aigen(path: str, mode: str = 'positive'):
         others = [row['sentence'] for row in rows if row['split'] == 'other']
     
     if mode == 'positive':
-        # [(row[0], row[1]) for row in aigens] + [(row, row) for row in others]
-        return [(row[0], row[1]) for row in aigens]
+        # return [(row[0], row[1]) for row in aigens] + [(row, row) for row in others]
+        if multiple_positive:
+            res = []
+            for row in aigens:
+                for i in range(1, len(row) - 1):
+                    res.append((row[0], row[i]))
+            return res
+        else:
+            return [(row[0], row[1]) for row in aigens]
     elif mode == 'negative':
-        another_others = others.copy()
-        random.shuffle(another_others)
-        # [(row[0], row[-1]) for row in aigens] + [(row0, row1) for row0, row1 in zip(others, another_others)]
-        return [(row[0], row[-1]) for row in aigens]
+        if whn:
+            another_others = others.copy()
+            random.shuffle(another_others)
+            # return [(row[0], row[-1]) for row in aigens] + [(row0, row1) for row0, row1 in zip(others, another_others)]
+            return [(row[0], row[-1]) for row in aigens]
+        else:
+            alls = aigens + others
+            another_alls = alls.copy()
+            random.shuffle(another_alls)
+            # return [(row0[0] if isinstance(row0, tuple) else row0, 
+            #          row1[0] if isinstance(row1, tuple) else row1) for row0, row1 in zip(alls, another_alls)]
+            
+            another_aigens = aigens.copy()
+            random.shuffle(another_aigens)
+            return [(row0[0], row1[0]) for row0, row1 in zip(aigens, another_aigens)]
+        # return [(row[0], row[-1]) for row in aigens]
     elif mode == 'all':
         res = []
         for row in aigens:
-            for sentence in row:
+            for sentence in (row if whn else row[:-1]):
                 res.append(sentence)
-        for row in others:
-            res.append(row)
+        # for row in others:
+        #     res.append(row)
         return res
     else:
         raise NotImplementedError
 
-def load_other_augmentation(path: str, mode: str = 'positive'):
+def load_other_augmentation(path: str, mode: str = 'positive', whn: bool = True):
     with open(path, 'r', encoding='utf8') as fi:
         rows = [json.loads(row) for row in fi]
         aigens = [(row['sentence'], row['5'])
@@ -178,10 +203,12 @@ def cal_embeddings(model, tokenizer, device, sentences, batch_size=256):
     features = torch.cat(features, dim=0)
     return features
 
-def collect_embeddings(ckpt_dir, sentences, max_size=None, base_model: str = 'bert-base-uncased'):
+def collect_embeddings(ckpt_dir, sentences, max_size=None, 
+    base_model: str = '/home/LAB/limx/download/model/bert-base-uncased'):
     save_name = 'ckpts_features_paired' if isinstance(sentences[0], tuple) else 'ckpts_features'
     if max_size is not None:
         save_name = f'{save_name}_{max_size}.pt'
+        random.shuffle(sentences)
         sentences = sentences[:max_size]
     else:
         save_name = f'{save_name}.pt'
@@ -213,14 +240,14 @@ def uniform_loss(x, t=2):
     x = F.normalize(x, dim=-1)
     return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
 
-def cal_alignment_and_uniformity(ckpt_dir, corpus_path, load_fn, 
+def cal_alignment_and_uniformity(ckpt_dir, corpus_path, whn, load_fn, 
     cal_aligment=True, cal_uniformity=True, 
     alignment_max_size=None, uniformity_max_size=None):
 
     # alignment
     if cal_aligment:
         print('Calculate Alignment:\n')
-        sentences = load_fn(corpus_path, mode='positive')
+        sentences = load_fn(corpus_path, mode='positive', whn=whn)
         ckpts_features = collect_embeddings(ckpt_dir, sentences, alignment_max_size)
         ckpts_alignment = {}
         for step, features in tqdm(ckpts_features.items()):
@@ -235,7 +262,7 @@ def cal_alignment_and_uniformity(ckpt_dir, corpus_path, load_fn,
     # uniformity
     if cal_uniformity:
         print('Calculate Uniformity:\n')
-        sentences = load_fn(corpus_path, mode='all')
+        sentences = load_fn(corpus_path, mode='all', whn=whn)
         ckpts_features = collect_embeddings(ckpt_dir, sentences, uniformity_max_size)
         ckpts_uniformity = {}
         for step, features in tqdm(ckpts_features.items()):
@@ -375,20 +402,79 @@ def cal_ious(sentence_pairs,
             ious.append(len(idx_set0 & idx_set1) / len(idx_set0 | idx_set1))
     return ious
 
-def collect_metrics4corpus(load_fn, corpus_arg, mode='positive', metrics='mer'):
-    sentence_pairs = load_fn(corpus_arg, mode=mode)
-    dump_dir = os.path.join(r'result/metrics', load_fn.__name__.split('_')[-1])
+def cal_cosine(sentence_pairs, model_path='/home/LAB/limx/download/model/bert-base-uncased', max_sentence_num=10000):
+    model, tokenizer, device = load_model(model_path)
+    if max_sentence_num > 0:
+        random.shuffle(sentence_pairs)
+        sentence_pairs = sentence_pairs[:max_sentence_num]
+
+    features = cal_embeddings(model, tokenizer, device, sentence_pairs)
+    cosine_similarities = F.cosine_similarity(features[:, 0], features[:, 1], dim=-1)
+    return cosine_similarities.tolist()
+
+def collect_metrics4corpus(load_fn, whn, corpus_arg, mode='positive', metrics='mer', dump_dir = None, max_num = None):
+    sentence_pairs = load_fn(corpus_arg, mode=mode, whn=whn)
+    if max_num:
+        random.shuffle(sentence_pairs)
+        sentence_pairs = sentence_pairs[:max_num]
+    if not dump_dir:
+        dump_dir = os.path.join(r'result/metrics', load_fn.__name__.split('_')[-1])
     os.makedirs(dump_dir, exist_ok=True)
 
     if metrics == 'mer':
         ms = cal_mers(sentence_pairs)
     elif metrics == 'iou':
         ms = cal_ious(sentence_pairs)
+    elif metrics == 'cosine':
+        ms = cal_cosine(sentence_pairs)
     else:
         raise NotImplementedError
     
     with open(os.path.join(dump_dir, f'{mode}_{metrics}'), 'w', encoding='utf8') as fo:
         fo.write('\n'.join(str(m) for m in ms))
+
+def collect_intra_adj_num(model, tokenizer, device, sentences, cache_dir, instance_name, dump_dir, 
+    max_num=10000, adj_max_distance = 4., split='all'):
+    if isinstance(sentences[0], tuple):
+        n_sentences = []
+        for sentence_pair in sentences:
+            for sentence in sentence_pair:
+                n_sentences.append(sentence)
+        sentences = n_sentences
+    
+    sts_embeddings_path = os.path.join(cache_dir, 'sts_embeddings_path.pt')
+    if os.path.exists(sts_embeddings_path):
+        print('Cache found, loading sts_embeddings... ')
+        sts_embeddings = torch.load(sts_embeddings_path)
+    else:
+        sts_sentences = load_stsb('validation', mode='all')
+        sts_embeddings = cal_embeddings(model, tokenizer, device, sts_sentences)
+        torch.save(sts_embeddings, sts_embeddings_path)
+
+    base_dir = os.path.join(cache_dir, instance_name)
+    os.makedirs(base_dir, exist_ok=True)
+    distances_path = os.path.join(base_dir, 'distances.pt') if split == 'all' else os.path.join(base_dir, f'distances_{split}.pt')
+    if os.path.exists(distances_path):
+        print('Cache found, loading distances... ')
+        distances = torch.load(distances_path)
+    else:
+        embeddings_path = os.path.join(base_dir, 'embeddings.pt') if split == 'all' else os.path.join(base_dir, f'embeddings_{split}.pt')
+        if os.path.exists(embeddings_path):
+            print('Cache found, loading embeddings... ')
+            embeddings = torch.load(embeddings_path)
+        else:
+            random.shuffle(sentences)
+            embeddings = cal_embeddings(model, tokenizer, device, sentences[:max_num])
+            torch.save(embeddings, embeddings_path)
+        distances = torch.norm(sts_embeddings[:, None] - embeddings[None], dim=-1)
+        torch.save(distances, distances_path)
+    avg_adj_num = (distances <= adj_max_distance).sum(dim=-1).float().mean()
+    
+    os.makedirs(dump_dir, exist_ok=True)
+    save_path = os.path.join(dump_dir, 'avg_adj_num' if split == 'all' else f'avg_adj_num_{split}')
+    with open(save_path, 'w', encoding='utf8') as fo:
+        fo.write(f"{avg_adj_num.item()}")
+    print(f"{avg_adj_num.item()}")
 
 if __name__ == '__main__':
 
@@ -434,18 +520,18 @@ if __name__ == '__main__':
     #     r'validation', load_stsb,
     #     alignment_max_size=10000, uniformity_max_size=10000)
     
-    cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_whn',
-        r'validation', load_stsb,  
-        alignment_max_size=10000, uniformity_max_size=10000)
-    cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_wohn',
-        r'validation', load_stsb,  
-        alignment_max_size=10000, uniformity_max_size=10000)
-    cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_whn',
-        r'validation', load_stsb,  
-        alignment_max_size=10000, uniformity_max_size=10000)
-    cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_wohn',
-        r'validation', load_stsb,  
-        alignment_max_size=10000, uniformity_max_size=10000)
+    # cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_whn',
+    #     r'validation', load_stsb,  
+    #     alignment_max_size=10000, uniformity_max_size=10000)
+    # cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_wohn',
+    #     r'validation', load_stsb,  
+    #     alignment_max_size=10000, uniformity_max_size=10000)
+    # cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_whn',
+    #     r'validation', load_stsb,  
+    #     alignment_max_size=10000, uniformity_max_size=10000)
+    # cal_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_wohn',
+    #     r'validation', load_stsb,  
+    #     alignment_max_size=10000, uniformity_max_size=10000)
 
     # assemble_alignment_and_uniformity(r'results/runs/test_token_shuffle')
     # assemble_alignment_and_uniformity(r'results/runs/test_token_cutoff')
@@ -461,10 +547,119 @@ if __name__ == '__main__':
     # assemble_alignment_and_uniformity(r'results/runs/test_align_sts_whn')
     # assemble_alignment_and_uniformity(r'results/runs/test_align_sts_wohn')
 
-    assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_whn')
-    assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_wohn')
-    assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_whn')
-    assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_wohn')
+    # assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_whn')
+    # assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_nli_wohn')
+    # assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_whn')
+    # assemble_alignment_and_uniformity(r'results/runs/test_sup_aigen_sts_wohn')
+
+    # max_num=1000
+    # for split in tqdm(['train', 'eval']):
+    #     for ratio in tqdm(range(10, 11)):
+    #         ckpt_path = os.path.join(r'results/runs/ratios', f'test_nli_wiki_{ratio}e-1')
+    #         data_path = os.path.join(r'data/230804/ratios', f'nli_wiki_{ratio}e-1_heldout.jsonl') if split == 'train' else 'validation'
+    #         load_fn = load_aigen if split == 'train' else load_stsb
+    #         cal_alignment_and_uniformity(ckpt_path, data_path, load_fn, 
+    #                                     alignment_max_size=max_num, uniformity_max_size=max_num)
+    #         assemble_alignment_and_uniformity(ckpt_path)
+    #         dst_dir = os.path.join(ckpt_path, split)
+    #         os.makedirs(dst_dir)
+    #         for file_name in ['alignment_and_uniformity.csv', 'alignments', 'uniformities',
+    #                           f'ckpts_features_{max_num}.pt', f'ckpts_features_paired_{max_num}.pt']:
+    #             os.system(f'mv {os.path.join(ckpt_path, file_name)} {dst_dir}')
+
+    
+    '''
+    max_num = 1000
+    # ckpt_paths = [
+    #     r'results/runs/aigens/test_wiki_nli_whn', r'results/runs/aigens/test_wiki_nli_wohn',
+    #     r'results/runs/aigens/test_wiki_sts_whn', r'results/runs/aigens/test_wiki_sts_wohn',
+    #     r'results/runs/aigens/test_nli_nli_whn', r'results/runs/aigens/test_nli_nli_wohn',
+    #     r'results/runs/aigens/test_nli_sts_whn', r'results/runs/aigens/test_nli_sts_wohn'
+    # ]
+    # data_paths = [
+    #     r'data/230729/wiki1m_aigen_nli_20k_2_heldout.jsonl', r'data/230729/wiki1m_aigen_nli_20k_2_heldout.jsonl',
+    #     r'data/230718/wiki1m_aigen_remove_negative_20k_4_heldout.json', r'data/230718/wiki1m_aigen_remove_negative_20k_4_heldout.json',
+    #     r'data/230802/nli20k_aigen_new_nli_2_heldout.jsonl', r'data/230802/nli20k_aigen_new_nli_2_heldout.jsonl',
+    #     r'data/230802/nli20k_aigen_sts_3_heldout.jsonl', r'data/230802/nli20k_aigen_sts_3_heldout.jsonl'
+    # ]
+    ckpt_paths = [
+        r'results/runs/aigens/test_nli_nli_whn', r'results/runs/aigens/test_nli_nli_wohn',
+        r'results/runs/aigens/test_nli_sts_whn', r'results/runs/aigens/test_nli_sts_wohn'
+    ]
+    data_paths = [
+        r'data/230807/nliunsup_aigen_nli_2_20k_heldout.jsonl', r'data/230807/nliunsup_aigen_nli_2_20k_heldout.jsonl',
+        r'data/230807/nliunsup_aigen_sts_3_20k_heldout.jsonl', r'data/230807/nliunsup_aigen_sts_3_20k_heldout.jsonl'
+    ]
+    for split in tqdm(['eval']):# 'train',
+        for ckpt_path, data_path in zip(ckpt_paths, data_paths):
+            load_fn = load_aigen
+            if split == 'eval':
+                data_path = 'validation'
+                load_fn = load_stsb
+            whn = 'whn' in ckpt_path
+            cal_alignment_and_uniformity(ckpt_path, data_path, whn, load_fn, 
+                                         alignment_max_size=max_num, uniformity_max_size=max_num)
+            assemble_alignment_and_uniformity(ckpt_path)
+            dst_dir = os.path.join(ckpt_path, split)
+            os.makedirs(dst_dir)
+            for file_name in ['alignment_and_uniformity.csv', 'alignments', 'uniformities',
+                              f'ckpts_features_{max_num}.pt', f'ckpts_features_paired_{max_num}.pt']:
+                os.system(f'mv {os.path.join(ckpt_path, file_name)} {dst_dir}')
+    '''
+
+    '''
+    for base in ['nli']: # 'wiki', 
+        for llm_method in ['nli', 'sts']:
+            for setting in ['whn', 'wohn']:
+                collect_loss_and_eval(os.path.join(r'results/logs/aigens', f'test_{base}_{llm_method}_{setting}.log'))
+    '''
+
+    max_num = 1000
+    ckpt_paths = [
+        # r'results/runs/aigens/test_sts/test_nli_sts_triplet_10e-2p2wohn',
+        r'results/runs/aigens/test_sts/test_wiki_sts_triplet_new_10e-2p2'
+    ]
+    data_paths = [
+        # r'data/230807/nliunsup_aigen_sts_3_20k_heldout.jsonl',
+        r'data/230728/wiki1m_aigen_remove_negative_20k_3_heldout.jsonl'
+    ]
+    for split in tqdm(['train','eval']): 
+        for ckpt_path, data_path in zip(ckpt_paths, data_paths):
+            load_fn = lambda path, mode, whn : load_aigen(path, mode, whn, True)
+            if split == 'eval':
+                data_path = 'validation'
+                load_fn = load_stsb
+            whn = 'whn' in ckpt_path
+            cal_alignment_and_uniformity(ckpt_path, data_path, whn, load_fn, 
+                                         alignment_max_size=max_num, uniformity_max_size=max_num)
+            assemble_alignment_and_uniformity(ckpt_path)
+            dst_dir = os.path.join(ckpt_path, split)
+            os.makedirs(dst_dir)
+            for file_name in ['alignment_and_uniformity.csv', 'alignments', 'uniformities',
+                              f'ckpts_features_{max_num}.pt', f'ckpts_features_paired_{max_num}.pt']:
+                os.system(f'mv {os.path.join(ckpt_path, file_name)} {dst_dir}')
+    collect_loss_and_eval(r'results/logs/aigens/test_sts/test_nli_sts_triplet_10e-2p2wohn.log')
+    collect_loss_and_eval(r'results/logs/aigens/test_sts/test_wiki_sts_triplet_new_10e-2p2.log')
+
+    '''
+    # ckpt_paths = [r'results/runs/test_token_cutoff']
+    # data_paths = [r'data/230730/wiki1m_token_cutoff_0.10_heldout.jsonl']
+    # for split in tqdm(['eval']): # 'train', 
+    #     for ckpt_path, data_path in zip(ckpt_paths, data_paths):
+    #         load_fn = load_other_augmentation
+    #         if split == 'eval':
+    #             data_path = 'validation'
+    #             load_fn = load_stsb
+    #         cal_alignment_and_uniformity(ckpt_path, data_path, True, load_fn, 
+    #                                      alignment_max_size=max_num, uniformity_max_size=max_num)
+    #         assemble_alignment_and_uniformity(ckpt_path)
+    #         dst_dir = os.path.join(ckpt_path, split)
+    #         os.makedirs(dst_dir)
+    #         for file_name in ['alignment_and_uniformity.csv', 'alignments', 'uniformities',
+    #                           f'ckpts_features_{max_num}.pt', f'ckpts_features_paired_{max_num}.pt']:
+    #             os.system(f'mv {os.path.join(ckpt_path, file_name)} {dst_dir}')
+    '''
+
 
     # collect_loss_and_eval(r'result/log/unsup.log')
     # collect_loss_and_eval(r'result/log/sup.log')
@@ -487,6 +682,9 @@ if __name__ == '__main__':
     # collect_loss_and_eval(r'results/logs/test_sup_aigen_sts_whn.log')
     # collect_loss_and_eval(r'results/logs/test_sup_aigen_sts_wohn.log')
     
+    # for ratio in range(11):
+    #     log_path = f'results/logs/ratios/test_nli_wiki_{ratio}e-1.log'
+    #     collect_loss_and_eval(log_path)
 
     # sentence_pairs = [
     #     ['Bryan Cranston will return as Walter White for breaking bad spin off, report claims.',
@@ -537,8 +735,100 @@ if __name__ == '__main__':
     # collect_metrics4corpus(load_other_augmentation, r'/home/LAB/limx/project/hyperbolic/HyperSent/data/230730/wiki1m_token_shuffle_train.jsonl',
     #     mode='negative', metrics='iou')
         
+    '''
+    # data_paths = [
+    #     r'data/230729/wiki1m_aigen_nli_20k_2_train.jsonl',
+    #     r'data/230718/wiki1m_aigen_remove_negative_20k_4_train.json',
+    #     r'data/230802/nli20k_aigen_new_nli_2_train.jsonl',
+    #     r'data/230802/nli20k_aigen_sts_3_train.jsonl'
+    # ]
+    # data_labels = [
+    #     'wiki_nli', 'wiki_sts', 
+    #     'nli_nli', 'nli_sts'
+    # ]
+    data_paths = [
+        r'data/230807/nliunsup_aigen_nli_2_20k_train.jsonl',
+        r'data/230807/nliunsup_aigen_sts_3_20k_train.jsonl'
+    ]
+    data_labels = [
+        'nli_nli', 'nli_sts'
+    ]
+    for split in tqdm(['positive', 'negative']):
+        for metric in tqdm(['mer', 'iou', 'cosine']):
+            for data_path, data_label in tqdm(zip(data_paths, data_labels)):
+                for whn in tqdm([True, False]):
+                    dump_dir = os.path.join(r'results/metrics/aigens', data_label, 'whn' if whn else 'wohn', 'inter')
+                    collect_metrics4corpus(load_aigen, whn, data_path, mode=split, metrics=metric, dump_dir=dump_dir, max_num=10000)
+    '''
+
+    # for split in tqdm(['positive', 'negative']):
+    #     for metric in tqdm(['mer', 'iou', 'cosine']):
+    #         for whn in tqdm([True, False]):
+    #             dump_dir = os.path.join(r'results/metrics/nli', 'whn' if whn else 'wohn', 'inter')
+    #             collect_metrics4corpus(load_nli, whn, r'/home/LAB/limx/project/hyperbolic/SimCSE/data/nli_train.csv',
+    #                                    mode=split, metrics=metric, dump_dir=dump_dir, max_num=10000)
 
     # cal_anu_bbu('bert-base-uncased', r'/home/LAB/limx/project/hyperbolic/SimCSE/data/wiki1m_heldout.txt',
     #             load_wiki, alignment_max_size=10000, uniformity_max_size=10000)
     # cal_anu_bbu('bert-base-uncased', r'/home/LAB/limx/project/hyperbolic/SimCSE/data/nli_heldout.csv',
     #             load_nli, alignment_max_size=10000, uniformity_max_size=10000)
+
+    '''
+    model, tokenizer, device = load_model('/home/LAB/limx/download/model/bert-base-uncased')
+    cache_dir = r'results/cache'
+    load_fns = [
+        load_aigen, load_aigen, load_aigen, load_aigen
+    ]
+    # data_paths = [
+    #     r'data/230729/wiki1m_aigen_nli_20k_2_train.jsonl',
+    #     r'data/230718/wiki1m_aigen_remove_negative_20k_4_train.json',
+    #     r'data/230802/nli20k_aigen_new_nli_2_train.jsonl',
+    #     r'data/230802/nli20k_aigen_sts_3_train.jsonl',
+    # ]
+    # instance_names = [
+    #     'wiki_nli', 'wiki_sts', 'nli_nli', 'nli_sts'
+    # ]
+    data_paths = [
+        r'data/230807/nliunsup_aigen_nli_2_20k_train.jsonl',
+        r'data/230807/nliunsup_aigen_sts_3_20k_train.jsonl'
+    ]
+    instance_names = [
+        'nli_nli', 'nli_sts'
+    ]
+    
+    for load_fn, data_path, instance_name in zip(load_fns, data_paths, instance_names):
+        for whn in [True, False]:
+            instance = f"aigen_{instance_name}_{'whn' if whn else 'wohn'}"
+            dump_dir = os.path.join(r'results/metrics/aigens', instance_name, 'whn' if whn else 'wohn', 'intra')
+            for split in ['positive', 'negative']:
+                sentences = load_fn(data_path, split, whn)
+                collect_intra_adj_num(model, tokenizer, device,
+                sentences, cache_dir, instance, dump_dir,
+                max_num=10000, adj_max_distance=4., split=split)
+    '''
+
+    '''
+    for whn in [True, False]:
+        instance = f"nli_{'whn' if whn else 'wohn'}"
+        dump_dir = os.path.join(r'results/metrics/nli', 'whn' if whn else 'wohn', 'intra')
+        for split in ['positive', 'negative']:
+            sentences = load_nli(r'/home/LAB/limx/project/hyperbolic/SimCSE/data/nli_train.csv', 
+                split, whn)
+            collect_intra_adj_num(model, tokenizer, device,
+                sentences, cache_dir, instance, dump_dir,
+                max_num=10000, adj_max_distance=4., split=split)
+    
+    for split in ['positive', 'negative']:
+        collect_intra_adj_num(model, tokenizer, device,
+            load_wiki(r'/home/LAB/limx/project/hyperbolic/SimCSE/data/wiki1m_train.txt', split), 
+            cache_dir, 'dropout', os.path.join(r'results/metrics/dropout', 'intra'), 
+            max_num=10000, adj_max_distance=4., split=split)
+        collect_intra_adj_num(model, tokenizer, device,
+            load_other_augmentation(r'data/230730/wiki1m_token_shuffle_train.jsonl', split), 
+            cache_dir, 'token_shuffle', os.path.join(r'results/metrics/token_shuffle', 'intra'), 
+            max_num=10000, adj_max_distance=4., split=split)
+        collect_intra_adj_num(model, tokenizer, device,
+            load_other_augmentation(r'data/230730/wiki1m_token_cutoff_train.jsonl', split), 
+            cache_dir, 'token_cutoff', os.path.join(r'results/metrics/token_cutoff', 'intra'), 
+            max_num=10000, adj_max_distance=4., split=split)
+    '''
